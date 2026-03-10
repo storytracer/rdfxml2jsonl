@@ -1,0 +1,22 @@
+[project]
+name = "rdfxml2jsonl"
+version = "0.1.0"
+description = "Bulk-convert RDF/XML to queryable JSONL or standards-compliant JSON-LD."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+    "rdflib>=7.0",
+    "click>=8.0",
+    "tqdm>=4.0",
+]
+
+[project.scripts]
+rdfxml2jsonl = "rdfxml2jsonl:cli"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+include = ["rdfxml2jsonl.py"]

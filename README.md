@@ -28,6 +28,12 @@ uv run rdfxml2jsonl.py batch input_dir/ -o output.jsonl.gz
 
 # Zip archive → gzipped JSONL
 uv run rdfxml2jsonl.py batch archive.zip -o output.jsonl.gz
+
+# Folder of zip archives → one .jsonl.gz per zip
+uv run rdfxml2jsonl.py batch zip_folder/ -o out_dir/
+
+# Use 8 parallel workers (default: 4)
+uv run rdfxml2jsonl.py batch zip_folder/ -o out_dir/ -w 8
 ```
 
 ## Output modes
@@ -78,7 +84,11 @@ uv run rdfxml2jsonl.py single [OPTIONS] INPUT_FILE
 
 ### `batch`
 
-Convert many RDF/XML files to a single gzipped JSONL file. Input can be a directory or a zip archive.
+Convert many RDF/XML files to gzipped JSONL. Input can be a directory of XML files, a zip archive, or a directory of zip archives.
+
+When given a directory of zip files (no XML files matching the glob pattern), each zip produces its own `.jsonl.gz` file with the same basename. Otherwise all input files are written to a single output file.
+
+Parsing is parallelised across files (or across zip archives in multi-zip mode) using a configurable number of workers.
 
 ```
 uv run rdfxml2jsonl.py batch [OPTIONS] INPUT_PATH
@@ -86,9 +96,10 @@ uv run rdfxml2jsonl.py batch [OPTIONS] INPUT_PATH
 
 | Option | Description |
 |---|---|
-| `-o, --output PATH` | Output file. Default: `<input>.jsonl.gz` |
+| `-o, --output PATH` | Output file (single source) or directory (folder of zips). Default: `<input>.jsonl.gz` |
 | `--jsonld` | Output valid JSON-LD instead of simplified JSON |
 | `--glob PATTERN` | File glob pattern (default: `*.xml`) |
+| `-w, --workers INT` | Number of parallel workers (default: `4`) |
 
 Each input file becomes one JSON line in the output. A `_source_file` field is added to every record for traceability.
 

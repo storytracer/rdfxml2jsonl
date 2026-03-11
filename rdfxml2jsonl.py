@@ -312,7 +312,7 @@ def _parse_chunk(
 def _batch_from_zips(
     zip_outputs: list[tuple[Path, Path]],
     jsonld: bool, pattern: str, workers: int,
-    resume: bool = False,
+    compresslevel: int = 1, resume: bool = False,
 ):
     """Process zip files sequentially with parallel chunk parsing within each.
 
@@ -407,7 +407,7 @@ def _batch_from_zips(
 
             try:
                 with gzip.open(
-                    str(tmp_path), "wt", encoding="utf-8", compresslevel=1,
+                    str(tmp_path), "wt", encoding="utf-8", compresslevel=compresslevel,
                 ) as gz:
                     if pool is None:
                         # Sequential (workers=1)
@@ -505,13 +505,13 @@ def _batch_from_zips(
 
 def _batch_single(
     entries: list[tuple[str, str | bytes]], output: str,
-    jsonld: bool, workers: int,
+    jsonld: bool, workers: int, compresslevel: int = 1,
 ):
     """Parse a list of (name, source) entries into a single .jsonl.gz."""
     pool_size = min(workers, len(entries))
     success, failed = 0, 0
 
-    with gzip.open(output, "wt", encoding="utf-8", compresslevel=1) as gz:
+    with gzip.open(output, "wt", encoding="utf-8", compresslevel=compresslevel) as gz:
         if pool_size <= 1:
             for name, source in tqdm(entries, desc="Converting", unit="file"):
                 try:
@@ -561,6 +561,7 @@ def _batch_from_zips_remote(
     jsonld: bool,
     pattern: str,
     workers: int,
+    compresslevel: int,
     resume: bool,
 ):
     """Download remote ZIP files to a local cache, then process them.
@@ -604,7 +605,7 @@ def _batch_from_zips_remote(
 
             _batch_from_zips(
                 [(cached_zip, local_output)],
-                jsonld, pattern, workers, resume=False,
+                jsonld, pattern, workers, compresslevel, resume=False,
             )
 
     except KeyboardInterrupt:
@@ -650,11 +651,12 @@ def single(input_file: str, output: str | None, jsonld: bool):
 @click.option("--jsonld", is_flag=True, help="Output valid JSON-LD instead of simplified JSON.")
 @click.option("--glob", "pattern", type=str, default="*.xml", help="File glob pattern. [default: *.xml]")
 @click.option("-w", "--workers", type=int, default=None, help="Parallel workers. [default: number of CPUs]")
+@click.option("--compresslevel", type=click.IntRange(0, 9), default=6, help="Gzip compression level (0=none, 9=max). [default: 1]")
 @click.option("--resume", is_flag=True, help="Skip zips whose output already exists.")
 @click.option("--cache-dir", type=click.Path(), default=None,
               help="Cache directory for remote downloads. [default: <output>/.cache]")
 def batch(input_path: str, output: str | None, jsonld: bool, pattern: str,
-          workers: int, resume: bool, cache_dir: str | None):
+          workers: int, compresslevel: int, resume: bool, cache_dir: str | None):
     """
     Convert many RDF/XML files to gzipped JSONL.
 
@@ -701,7 +703,7 @@ def batch(input_path: str, output: str | None, jsonld: bool, pattern: str,
                     (Path(zf), out_dir / (Path(zf).stem + ".jsonl.gz"))
                     for zf in zip_files
                 ]
-                _batch_from_zips(zip_outputs, jsonld, pattern, workers, resume=resume)
+                _batch_from_zips(zip_outputs, jsonld, pattern, workers, compresslevel, resume=resume)
                 return
 
             if not entries:
@@ -714,7 +716,7 @@ def batch(input_path: str, output: str | None, jsonld: bool, pattern: str,
 
             if output is None:
                 output = str(Path(root).with_suffix(".jsonl.gz"))
-            _batch_single(entries, output, jsonld, workers)
+            _batch_single(entries, output, jsonld, workers, compresslevel)
             return
 
         else:
@@ -731,7 +733,7 @@ def batch(input_path: str, output: str | None, jsonld: bool, pattern: str,
             c_dir = Path(cache_dir) if cache_dir else out_dir / ".cache"
             _batch_from_zips_remote(
                 fs, zip_files, out_dir, c_dir,
-                jsonld, pattern, workers, resume,
+                jsonld, pattern, workers, compresslevel, resume,
             )
             return
 
@@ -742,7 +744,7 @@ def batch(input_path: str, output: str | None, jsonld: bool, pattern: str,
                 output = str(Path(root).with_suffix(".jsonl.gz"))
             _batch_from_zips(
                 [(Path(root), Path(output))],
-                jsonld, pattern, workers, resume=resume,
+                jsonld, pattern, workers, compresslevel, resume=resume,
             )
         else:
             out_dir = Path(output) if output else Path(".")
@@ -750,7 +752,7 @@ def batch(input_path: str, output: str | None, jsonld: bool, pattern: str,
             c_dir = Path(cache_dir) if cache_dir else out_dir / ".cache"
             _batch_from_zips_remote(
                 fs, [root], out_dir, c_dir,
-                jsonld, pattern, workers, resume,
+                jsonld, pattern, workers, compresslevel, resume,
             )
         return
 

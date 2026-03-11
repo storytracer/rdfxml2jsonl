@@ -9,6 +9,7 @@ dependencies = [
     "rdflib>=7.0",
     "click>=8.0",
     "tqdm>=4.0",
+    "fsspec>=2026.2.0",
 ]
 
 [project.scripts]

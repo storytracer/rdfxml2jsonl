@@ -4,6 +4,7 @@
 #     "rdflib>=7.0",
 #     "click>=8.0",
 #     "tqdm>=4.0",
+#     "fsspec>=2026.2.0",
 # ]
 # ///
 """
@@ -59,6 +60,9 @@ from io import BytesIO
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Generator
+
+import fsspec
+from fsspec.implementations.local import LocalFileSystem
 
 import click
 from rdflib import Graph
@@ -542,6 +546,75 @@ def _batch_single(
 
 
 # ---------------------------------------------------------------------------
+# Remote storage helpers (fsspec)
+# ---------------------------------------------------------------------------
+
+def _batch_from_zips_remote(
+    fs: fsspec.AbstractFileSystem,
+    zip_paths: list[str],
+    out_dir: Path,
+    cache_dir: Path,
+    jsonld: bool,
+    pattern: str,
+    workers: int,
+    resume: bool,
+):
+    """Download remote ZIP files to a local cache, then process them.
+
+    Each ZIP is downloaded via *fs* to *cache_dir*.  Already-cached files
+    are reused without re-downloading.  Processing is delegated to the
+    existing ``_batch_from_zips`` pipeline which operates on local paths.
+    """
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    n = len(zip_paths)
+    skipped_resume = 0
+
+    try:
+        for idx, remote_zip in enumerate(zip_paths, 1):
+            zip_name = remote_zip.rsplit("/", 1)[-1]
+            stem = zip_name.rsplit(".", 1)[0]
+            local_output = out_dir / f"{stem}.jsonl.gz"
+            cached_zip = cache_dir / zip_name
+
+            # Resume: skip if output already exists
+            if resume and local_output.exists():
+                skipped_resume += 1
+                continue
+
+            # Download only if not already cached
+            if not cached_zip.exists():
+                try:
+                    info = fs.info(remote_zip)
+                    size_mb = info.get("size", 0) / (1024 * 1024)
+                    click.echo(
+                        f"[{idx}/{n}] Downloading {zip_name} "
+                        f"({size_mb:.0f} MB)..."
+                    )
+                except Exception:
+                    click.echo(f"[{idx}/{n}] Downloading {zip_name}...")
+
+                fs.get(remote_zip, str(cached_zip))
+            else:
+                click.echo(f"[{idx}/{n}] Using cached {zip_name}")
+
+            _batch_from_zips(
+                [(cached_zip, local_output)],
+                jsonld, pattern, workers, resume=False,
+            )
+
+    except KeyboardInterrupt:
+        click.echo("\n\nInterrupted.", err=True)
+        click.echo(
+            "Re-run with --resume to continue where you left off.", err=True,
+        )
+        sys.exit(130)
+
+    if skipped_resume:
+        click.echo(f"Resuming: skipped {skipped_resume} already-completed zip(s).")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -568,61 +641,114 @@ def single(input_file: str, output: str | None, indent: int, jsonld: bool):
 
 
 @cli.command()
-@click.argument("input_path", type=click.Path(exists=True))
+@click.argument("input_path", type=str)
 @click.option("-o", "--output", type=click.Path(), default=None,
               help="Output file (single source) or directory (folder of zips).")
 @click.option("--jsonld", is_flag=True, help="Output valid JSON-LD instead of simplified JSON.")
 @click.option("--glob", "pattern", type=str, default="*.xml", help="File glob pattern. [default: *.xml]")
 @click.option("-w", "--workers", type=int, default=4, help="Parallel workers. [default: 4]")
 @click.option("--resume", is_flag=True, help="Skip zips whose output already exists.")
-def batch(input_path: str, output: str | None, jsonld: bool, pattern: str, workers: int, resume: bool):
+@click.option("--cache-dir", type=click.Path(), default=None,
+              help="Cache directory for remote downloads. [default: <output>/.cache]")
+def batch(input_path: str, output: str | None, jsonld: bool, pattern: str,
+          workers: int, resume: bool, cache_dir: str | None):
     """
     Convert many RDF/XML files to gzipped JSONL.
 
-    INPUT_PATH can be a directory of XML files, a .zip archive, or a
-    directory of .zip archives.  In the first two cases every input
-    file becomes one JSON line in a single output file.  In the last
-    case each zip archive produces its own .jsonl.gz file.
+    INPUT_PATH can be a local path or any fsspec-compatible URL
+    (ftp://user:pass@host/path/, s3://bucket/prefix/, …).
+
+    Accepts a directory of XML files, a .zip archive, or a directory
+    of .zip archives.  For a single source every input file becomes
+    one JSON line in a single output.  For multiple zips each archive
+    produces its own .jsonl.gz file.
+
+    Credentials for remote storage are embedded in the URL.
 
     A "_source_file" field is added to every record for traceability.
     Use --jsonld for standards-compliant JSON-LD output.
     """
-    src = Path(input_path)
     workers = max(1, workers)
 
-    # --- Directory input: detect folder-of-zips vs XML files ---
-    if src.is_dir():
-        zip_files = sorted(src.glob("*.zip"))
-        entries = list(iter_xml_from_dir(src, pattern))
+    # --- Resolve input via fsspec (handles local paths and remote URLs) ---
+    try:
+        fs, root = fsspec.url_to_fs(input_path)
+    except Exception as exc:
+        click.echo(f"Error: cannot open {input_path}: {exc}", err=True)
+        sys.exit(1)
 
-        if not entries and zip_files:
-            # Multi-zip mode — one .jsonl.gz per zip
-            out_dir = Path(output) if output else src
-            zip_outputs = [
-                (zf, out_dir / zf.with_suffix(".jsonl.gz").name)
-                for zf in zip_files
-            ]
-            _batch_from_zips(zip_outputs, jsonld, pattern, workers, resume=resume)
+    is_local = isinstance(fs, LocalFileSystem)
+
+    if not fs.exists(root):
+        click.echo(f"Error: {input_path} does not exist.", err=True)
+        sys.exit(1)
+
+    # --- Directory input ---
+    if fs.isdir(root):
+        zip_files = sorted(
+            p for p in fs.ls(root, detail=False) if p.endswith(".zip")
+        )
+
+        if is_local:
+            entries = list(iter_xml_from_dir(Path(root), pattern))
+
+            if not entries and zip_files:
+                out_dir = Path(output) if output else Path(root)
+                zip_outputs = [
+                    (Path(zf), out_dir / (Path(zf).stem + ".jsonl.gz"))
+                    for zf in zip_files
+                ]
+                _batch_from_zips(zip_outputs, jsonld, pattern, workers, resume=resume)
+                return
+
+            if not entries:
+                click.echo(
+                    f"Error: no files matching '{pattern}' and no .zip files "
+                    f"in {input_path}",
+                    err=True,
+                )
+                sys.exit(1)
+
+            if output is None:
+                output = str(Path(root).with_suffix(".jsonl.gz"))
+            _batch_single(entries, output, jsonld, workers)
             return
 
-        if not entries:
-            click.echo(
-                f"Error: no files matching '{pattern}' and no .zip files in {src}",
-                err=True,
+        else:
+            # Remote directory — must contain zips
+            if not zip_files:
+                click.echo(
+                    f"Error: no .zip files found at {input_path}", err=True,
+                )
+                sys.exit(1)
+
+            click.echo(f"Found {len(zip_files)} zip(s) at {input_path}")
+            out_dir = Path(output) if output else Path(".")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            c_dir = Path(cache_dir) if cache_dir else out_dir / ".cache"
+            _batch_from_zips_remote(
+                fs, zip_files, out_dir, c_dir,
+                jsonld, pattern, workers, resume,
             )
-            sys.exit(1)
+            return
 
-        # Directory of XML files — use _batch_single (paths are cheap to pickle)
-        if output is None:
-            output = str(src.with_suffix(".jsonl.gz"))
-        _batch_single(entries, output, jsonld, workers)
-        return
-
-    elif src.is_file() and zipfile.is_zipfile(src):
-        # Single zip — route through chunk-based parallel processing
-        if output is None:
-            output = str(src.with_suffix(".jsonl.gz"))
-        _batch_from_zips([(src, Path(output))], jsonld, pattern, workers, resume=resume)
+    # --- Single zip input ---
+    if root.endswith(".zip") and fs.isfile(root):
+        if is_local:
+            if output is None:
+                output = str(Path(root).with_suffix(".jsonl.gz"))
+            _batch_from_zips(
+                [(Path(root), Path(output))],
+                jsonld, pattern, workers, resume=resume,
+            )
+        else:
+            out_dir = Path(output) if output else Path(".")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            c_dir = Path(cache_dir) if cache_dir else out_dir / ".cache"
+            _batch_from_zips_remote(
+                fs, [root], out_dir, c_dir,
+                jsonld, pattern, workers, resume,
+            )
         return
 
     click.echo(f"Error: {input_path} is not a directory or zip file.", err=True)

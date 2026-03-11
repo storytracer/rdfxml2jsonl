@@ -5,6 +5,7 @@
 #     "click>=8.0",
 #     "tqdm>=4.0",
 #     "fsspec>=2026.2.0",
+#     "orjson>=3.10",
 # ]
 # ///
 """
@@ -52,7 +53,7 @@ Usage:
 """
 
 import gzip
-import json
+import orjson
 import logging
 import sys
 import zipfile
@@ -209,7 +210,7 @@ def parse_rdfxml(source: str | bytes, jsonld: bool = False) -> dict:
 
     context = context_from_graph(g)
     jsonld_str = g.serialize(format="json-ld", indent=None, context=context)
-    data = json.loads(jsonld_str)
+    data = orjson.loads(jsonld_str)
 
     if jsonld:
         return data
@@ -274,7 +275,7 @@ def _parse_one(
     try:
         data = parse_rdfxml(source, jsonld=jsonld)
         data["_source_file"] = name
-        line = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+        line = orjson.dumps(data).decode()
         return (name, line, None)
     except Exception as e:
         return (name, None, f"{name} — {e}")
@@ -296,7 +297,7 @@ def _parse_chunk(
                 xml_bytes = zf.read(entry_name)
                 data = parse_rdfxml(xml_bytes, jsonld=jsonld)
                 data["_source_file"] = source_name
-                line = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+                line = orjson.dumps(data).decode()
                 results.append((source_name, line, None))
             except Exception as e:
                 results.append((source_name, None, f"{source_name} — {e}"))
@@ -513,7 +514,7 @@ def _batch_single(
                 try:
                     data = parse_rdfxml(source, jsonld=jsonld)
                     data["_source_file"] = name
-                    gz.write(json.dumps(data, ensure_ascii=False, separators=(",", ":")))
+                    gz.write(orjson.dumps(data).decode())
                     gz.write("\n")
                     success += 1
                 except Exception as e:
@@ -626,9 +627,8 @@ def cli():
 @cli.command()
 @click.argument("input_file", type=click.Path(exists=True, dir_okay=False))
 @click.option("-o", "--output", type=click.Path(), default=None, help="Output path. Default: input with .json/.jsonld extension.")
-@click.option("--indent", type=int, default=2, help="JSON indent level.")
 @click.option("--jsonld", is_flag=True, help="Output valid JSON-LD instead of simplified JSON.")
-def single(input_file: str, output: str | None, indent: int, jsonld: bool):
+def single(input_file: str, output: str | None, jsonld: bool):
     """Convert a single RDF/XML file to JSON or JSON-LD."""
     data = parse_rdfxml(input_file, jsonld=jsonld)
 
@@ -636,7 +636,7 @@ def single(input_file: str, output: str | None, indent: int, jsonld: bool):
         suffix = ".jsonld" if jsonld else ".json"
         output = str(Path(input_file).with_suffix(suffix))
 
-    Path(output).write_text(json.dumps(data, indent=indent, ensure_ascii=False), encoding="utf-8")
+    Path(output).write_bytes(orjson.dumps(data, option=orjson.OPT_INDENT_2))
     click.echo(f"Converted: {input_file} -> {output}")
 
 

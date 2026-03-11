@@ -248,19 +248,7 @@ def iter_xml_from_zip(
 # Parallel processing workers
 # ---------------------------------------------------------------------------
 
-_CHUNK_SIZE_MIN = 100    # floor: below this IPC overhead per task dominates
-_CHUNK_SIZE_MAX = 10_000 # ceiling: cap per-chunk result size (~50 MB pickled)
-
-
-def _adaptive_chunk_size(n_entries: int, workers: int) -> int:
-    """Choose chunk size targeting ~workers*8 tasks per zip.
-
-    Fewer, larger chunks reduce zip-central-directory re-reads; more, smaller
-    chunks keep all workers busy.  Clamped to [_CHUNK_SIZE_MIN, _CHUNK_SIZE_MAX].
-    """
-    target_chunks = max(1, workers) * 8
-    size = n_entries // target_chunks if target_chunks else n_entries
-    return max(_CHUNK_SIZE_MIN, min(_CHUNK_SIZE_MAX, size))
+_CHUNK_SIZE = 500
 
 
 def _init_worker():
@@ -388,8 +376,8 @@ def _batch_from_zips(
                 skipped_empty += 1
                 continue
 
-            # 1b. Adaptive chunking -------------------------------------
-            chunk_size = _adaptive_chunk_size(len(members), pool_size)
+            # 1b. Chunking ------------------------------------------------
+            chunk_size = _CHUNK_SIZE
             chunks = [
                 members[i : i + chunk_size]
                 for i in range(0, len(members), chunk_size)

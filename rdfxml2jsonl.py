@@ -53,6 +53,7 @@ Usage:
 """
 
 import gzip
+import os
 import orjson
 import logging
 import sys
@@ -406,7 +407,7 @@ def _batch_from_zips(
 
             try:
                 with gzip.open(
-                    str(tmp_path), "wt", encoding="utf-8", compresslevel=6,
+                    str(tmp_path), "wt", encoding="utf-8", compresslevel=1,
                 ) as gz:
                     if pool is None:
                         # Sequential (workers=1)
@@ -510,7 +511,7 @@ def _batch_single(
     pool_size = min(workers, len(entries))
     success, failed = 0, 0
 
-    with gzip.open(output, "wt", encoding="utf-8", compresslevel=6) as gz:
+    with gzip.open(output, "wt", encoding="utf-8", compresslevel=1) as gz:
         if pool_size <= 1:
             for name, source in tqdm(entries, desc="Converting", unit="file"):
                 try:
@@ -648,7 +649,7 @@ def single(input_file: str, output: str | None, jsonld: bool):
               help="Output file (single source) or directory (folder of zips).")
 @click.option("--jsonld", is_flag=True, help="Output valid JSON-LD instead of simplified JSON.")
 @click.option("--glob", "pattern", type=str, default="*.xml", help="File glob pattern. [default: *.xml]")
-@click.option("-w", "--workers", type=int, default=4, help="Parallel workers. [default: 4]")
+@click.option("-w", "--workers", type=int, default=None, help="Parallel workers. [default: number of CPUs]")
 @click.option("--resume", is_flag=True, help="Skip zips whose output already exists.")
 @click.option("--cache-dir", type=click.Path(), default=None,
               help="Cache directory for remote downloads. [default: <output>/.cache]")
@@ -670,7 +671,7 @@ def batch(input_path: str, output: str | None, jsonld: bool, pattern: str,
     A "_source_file" field is added to every record for traceability.
     Use --jsonld for standards-compliant JSON-LD output.
     """
-    workers = max(1, workers)
+    workers = max(1, workers if workers is not None else os.cpu_count() or 4)
 
     # --- Resolve input via fsspec (handles local paths and remote URLs) ---
     try:

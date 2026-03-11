@@ -67,6 +67,7 @@ from fsspec.implementations.local import LocalFileSystem
 
 import click
 from rdflib import Graph
+from rdflib.plugins.serializers.jsonld import from_rdf
 from tqdm import tqdm
 
 # rdflib logs noisy tracebacks for certain literal type conversions that fail
@@ -209,8 +210,7 @@ def parse_rdfxml(source: str | bytes, jsonld: bool = False) -> dict:
         g.parse(source, format="xml")
 
     context = context_from_graph(g)
-    jsonld_str = g.serialize(format="json-ld", indent=None, context=context)
-    data = orjson.loads(jsonld_str)
+    data = from_rdf(g, context_data=context)
 
     if jsonld:
         return data

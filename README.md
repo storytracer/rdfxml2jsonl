@@ -34,6 +34,9 @@ uv run rdfxml2jsonl.py batch zip_folder/ -o out_dir/
 
 # Use 8 parallel workers (default: 4)
 uv run rdfxml2jsonl.py batch zip_folder/ -o out_dir/ -w 8
+
+# Resume after interruption (skips already-completed zips)
+uv run rdfxml2jsonl.py batch zip_folder/ -o out_dir/ --resume
 ```
 
 ## Output modes
@@ -100,6 +103,7 @@ uv run rdfxml2jsonl.py batch [OPTIONS] INPUT_PATH
 | `--jsonld` | Output valid JSON-LD instead of simplified JSON |
 | `--glob PATTERN` | File glob pattern (default: `*.xml`) |
 | `-w, --workers INT` | Number of parallel workers (default: `4`) |
+| `--resume` | Skip zips whose output already exists (for crash recovery) |
 
 Each input file becomes one JSON line in the output. A `_source_file` field is added to every record for traceability.
 
@@ -164,7 +168,7 @@ df = pl.read_ndjson("output.jsonl.gz")
 
 - **Simplified JSON is not round-trippable.** URI references, typed literals, and type annotations are stripped. Use `--jsonld` when you need to preserve full RDF semantics.
 - **Schema varies by input.** Different RDF/XML files may produce different top-level keys depending on which types they contain. DuckDB and Polars handle this gracefully via schema inference; rigid column stores may not.
-- **Large zip archives are read into memory** one file at a time. The full zip member list is materialised for the progress bar.
+- **Processing is bounded per zip.** Only one zip's entry list and output handle are held in memory at a time, so even very large archives (10 GB+) and large batches (thousands of zips) are handled efficiently.
 
 ## License
 

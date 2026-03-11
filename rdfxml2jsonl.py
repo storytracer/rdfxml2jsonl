@@ -243,7 +243,19 @@ def iter_xml_from_zip(
 # Parallel processing workers
 # ---------------------------------------------------------------------------
 
-_CHUNK_SIZE = 100  # entries per worker task — balances IPC overhead vs utilisation
+_CHUNK_SIZE_MIN = 100    # floor: below this IPC overhead per task dominates
+_CHUNK_SIZE_MAX = 10_000 # ceiling: cap per-chunk result size (~50 MB pickled)
+
+
+def _adaptive_chunk_size(n_entries: int, workers: int) -> int:
+    """Choose chunk size targeting ~workers*8 tasks per zip.
+
+    Fewer, larger chunks reduce zip-central-directory re-reads; more, smaller
+    chunks keep all workers busy.  Clamped to [_CHUNK_SIZE_MIN, _CHUNK_SIZE_MAX].
+    """
+    target_chunks = max(1, workers) * 8
+    size = n_entries // target_chunks if target_chunks else n_entries
+    return max(_CHUNK_SIZE_MIN, min(_CHUNK_SIZE_MAX, size))
 
 
 def _init_worker():
@@ -294,104 +306,193 @@ def _parse_chunk(
 def _batch_from_zips(
     zip_outputs: list[tuple[Path, Path]],
     jsonld: bool, pattern: str, workers: int,
+    resume: bool = False,
 ):
-    """Process one or more zip files with fine-grained chunk-based parallelism.
+    """Process zip files sequentially with parallel chunk parsing within each.
 
-    *zip_outputs* is a list of (zip_path, output_path) pairs.  Each zip
-    produces its own .jsonl.gz.  XML entries from **all** zips are chunked
-    and distributed across workers so every core stays busy regardless of
-    individual zip sizes.
+    Zips are processed one at a time through a shared worker pool.  This
+    bounds memory and open file handles to O(1 zip) regardless of batch
+    size, while keeping all CPU cores saturated via adaptive chunking.
+
+    Args:
+        zip_outputs: (zip_path, output_path) pairs — one .jsonl.gz per zip.
+        jsonld:      Output valid JSON-LD instead of simplified JSON.
+        pattern:     Glob pattern for matching entries (e.g. ``"*.xml"``).
+        workers:     Number of parallel workers.
+        resume:      Skip zips whose output already exists.
     """
     suffix = pattern.replace("*", "")  # e.g. "*.xml" -> ".xml"
+    pool_size = max(1, workers)
+    n_total = len(zip_outputs)
 
-    # --- 1. Enumerate entries (central-directory only, no decompression) ---
-    # chunks: [(zip_path_str, output_path_str, [entry_name, …]), …]
-    chunks: list[tuple[str, str, list[str]]] = []
-    total_files = 0
+    # --- Phase 0: filter (resume) and clean stale .tmp files ---
+    to_process: list[tuple[Path, Path]] = []
+    skipped_resume = 0
 
     for zp, out in zip_outputs:
         out.parent.mkdir(parents=True, exist_ok=True)
-        with zipfile.ZipFile(zp, "r") as zf:
-            members = sorted(
-                n for n in zf.namelist()
-                if n.endswith(suffix) and not n.startswith("__MACOSX")
-            )
-        total_files += len(members)
-        zp_str, out_str = str(zp), str(out)
-        for i in range(0, len(members), _CHUNK_SIZE):
-            chunks.append((zp_str, out_str, members[i : i + _CHUNK_SIZE]))
+        tmp = Path(str(out) + ".tmp")
+        if tmp.exists():
+            tmp.unlink()
+        if resume and out.exists():
+            skipped_resume += 1
+            continue
+        to_process.append((zp, out))
 
-    if total_files == 0:
-        click.echo("No matching files found in the provided zip(s).", err=True)
-        sys.exit(1)
+    if skipped_resume:
+        click.echo(f"Resuming: skipped {skipped_resume} already-completed zip(s).")
+    if not to_process:
+        click.echo("Nothing to process — all outputs already exist.")
+        return
 
-    # --- 2. Process chunks in parallel ---
-    pool_size = min(workers, len(chunks))
-    # keyed by output path → {ok, fail}
-    stats: dict[str, dict[str, int]] = {
-        str(out): {"ok": 0, "fail": 0} for _, out in zip_outputs
-    }
-    gz_handles: dict[str, gzip.GzipFile] = {}
+    # --- Phase 1: process each zip through a shared pool ---
+    grand_ok, grand_fail = 0, 0
+    skipped_bad, skipped_empty = 0, 0
+    n_to_do = len(to_process)
+    current_tmp: Path | None = None
+
+    pool = (
+        ProcessPoolExecutor(max_workers=pool_size, initializer=_init_worker)
+        if pool_size > 1
+        else None
+    )
 
     try:
-        for _, out in zip_outputs:
-            gz_handles[str(out)] = gzip.open(
-                str(out), "wt", encoding="utf-8", compresslevel=6,
+        for zip_idx, (zp, out) in enumerate(to_process, 1):
+            # 1a. Read central directory --------------------------------
+            try:
+                zf_handle = zipfile.ZipFile(zp, "r")
+            except (zipfile.BadZipFile, EOFError, OSError) as exc:
+                tqdm.write(f"[{zip_idx}/{n_to_do}] SKIP {zp.name}: {exc}")
+                skipped_bad += 1
+                continue
+
+            with zf_handle:
+                members = sorted(
+                    n for n in zf_handle.namelist()
+                    if n.endswith(suffix) and not n.startswith("__MACOSX")
+                )
+
+            if not members:
+                tqdm.write(
+                    f"[{zip_idx}/{n_to_do}] SKIP {zp.name}: "
+                    f"no entries matching '{pattern}'"
+                )
+                skipped_empty += 1
+                continue
+
+            # 1b. Adaptive chunking -------------------------------------
+            chunk_size = _adaptive_chunk_size(len(members), pool_size)
+            chunks = [
+                members[i : i + chunk_size]
+                for i in range(0, len(members), chunk_size)
+            ]
+
+            # 1c. Process chunks → write to .tmp ------------------------
+            tmp_path = Path(str(out) + ".tmp")
+            current_tmp = tmp_path
+            ok, fail = 0, 0
+            zp_str = str(zp)
+            desc = (
+                f"[{zip_idx}/{n_to_do}] {zp.name}"
             )
 
-        if pool_size <= 1:
-            # Sequential
-            for zp_str, out_str, names in tqdm(chunks, desc="Converting", unit="chunk"):
-                results = _parse_chunk(zp_str, names, jsonld)
-                gz = gz_handles[out_str]
-                for _name, line, error in results:
-                    if line is not None:
-                        gz.write(line)
-                        gz.write("\n")
-                        stats[out_str]["ok"] += 1
+            try:
+                with gzip.open(
+                    str(tmp_path), "wt", encoding="utf-8", compresslevel=6,
+                ) as gz:
+                    if pool is None:
+                        # Sequential (workers=1)
+                        for chunk_names in tqdm(
+                            chunks, desc=desc, unit="chunk", leave=False,
+                        ):
+                            results = _parse_chunk(zp_str, chunk_names, jsonld)
+                            for _n, line, error in results:
+                                if line is not None:
+                                    gz.write(line)
+                                    gz.write("\n")
+                                    ok += 1
+                                else:
+                                    tqdm.write(f"  FAILED: {error}")
+                                    fail += 1
                     else:
-                        tqdm.write(f"  FAILED: {error}")
-                        stats[out_str]["fail"] += 1
-        else:
-            with ProcessPoolExecutor(max_workers=pool_size, initializer=_init_worker) as pool:
-                futures = {
-                    pool.submit(_parse_chunk, zp_str, names, jsonld): out_str
-                    for zp_str, out_str, names in chunks
-                }
-                with tqdm(total=total_files, desc="Converting", unit="file") as pbar:
-                    for fut in as_completed(futures):
-                        out_str = futures[fut]
-                        results = fut.result()
-                        gz = gz_handles[out_str]
-                        for _name, line, error in results:
-                            if line is not None:
-                                gz.write(line)
-                                gz.write("\n")
-                                stats[out_str]["ok"] += 1
-                            else:
-                                tqdm.write(f"  FAILED: {error}")
-                                stats[out_str]["fail"] += 1
-                        pbar.update(len(results))
+                        # Parallel
+                        futures = {
+                            pool.submit(_parse_chunk, zp_str, names, jsonld): names
+                            for names in chunks
+                        }
+                        with tqdm(
+                            total=len(members), desc=desc,
+                            unit="file", leave=False,
+                        ) as pbar:
+                            for fut in as_completed(futures):
+                                try:
+                                    results = fut.result()
+                                except Exception as exc:
+                                    failed_names = futures[fut]
+                                    tqdm.write(
+                                        f"  CHUNK ERROR ({len(failed_names)} "
+                                        f"entries): {exc}"
+                                    )
+                                    fail += len(failed_names)
+                                    pbar.update(len(failed_names))
+                                    continue
+
+                                for _n, line, error in results:
+                                    if line is not None:
+                                        gz.write(line)
+                                        gz.write("\n")
+                                        ok += 1
+                                    else:
+                                        tqdm.write(f"  FAILED: {error}")
+                                        fail += 1
+                                pbar.update(len(results))
+
+                # 1d. Atomic rename on success --------------------------
+                tmp_path.rename(out)
+                current_tmp = None
+
+            except Exception as exc:
+                tqdm.write(f"  ZIP ERROR {zp.name}: {exc}")
+                if tmp_path.exists():
+                    tmp_path.unlink()
+                current_tmp = None
+                skipped_bad += 1
+                continue
+
+            # 1e. Per-zip summary ---------------------------------------
+            size_mb = out.stat().st_size / (1024 * 1024)
+            tqdm.write(
+                f"  => {out.name}: {ok:,} ok, {fail:,} failed "
+                f"({size_mb:.1f} MB)"
+            )
+            grand_ok += ok
+            grand_fail += fail
+            del members, chunks
+
+    except KeyboardInterrupt:
+        click.echo("\n\nInterrupted.", err=True)
+        if current_tmp is not None and current_tmp.exists():
+            current_tmp.unlink()
+            click.echo(f"Cleaned up: {current_tmp.name}", err=True)
+        click.echo(
+            "Re-run with --resume to continue where you left off.", err=True,
+        )
+        sys.exit(130)
+
     finally:
-        for gz in gz_handles.values():
-            gz.close()
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
 
-    # --- 3. Report ---
-    total_ok = sum(s["ok"] for s in stats.values())
-    total_fail = sum(s["fail"] for s in stats.values())
-    n_zips = len(zip_outputs)
-
-    if n_zips == 1:
-        out_path = str(zip_outputs[0][1])
-        click.echo(f"\nWrote {out_path}")
-        click.echo(f"  {total_ok} converted, {total_fail} failed out of {total_files} files.")
-        if total_ok > 0:
-            size_mb = Path(out_path).stat().st_size / (1024 * 1024)
-            click.echo(f"  File size: {size_mb:.1f} MB")
-    else:
-        out_dir = zip_outputs[0][1].parent
-        click.echo(f"\nWrote {n_zips} .jsonl.gz files to {out_dir}")
-        click.echo(f"  {total_ok} records converted, {total_fail} failed across {n_zips} zip files.")
+    # --- Phase 2: final report ---
+    click.echo(f"\nDone. Processed {n_to_do} zip(s) of {n_total} total.")
+    if skipped_resume:
+        click.echo(f"  Skipped (resume):  {skipped_resume}")
+    if skipped_empty:
+        click.echo(f"  Skipped (empty):   {skipped_empty}")
+    if skipped_bad:
+        click.echo(f"  Skipped (bad zip): {skipped_bad}")
+    click.echo(f"  Records: {grand_ok:,} converted, {grand_fail:,} failed.")
 
 
 def _batch_single(
@@ -473,7 +574,8 @@ def single(input_file: str, output: str | None, indent: int, jsonld: bool):
 @click.option("--jsonld", is_flag=True, help="Output valid JSON-LD instead of simplified JSON.")
 @click.option("--glob", "pattern", type=str, default="*.xml", help="File glob pattern. [default: *.xml]")
 @click.option("-w", "--workers", type=int, default=4, help="Parallel workers. [default: 4]")
-def batch(input_path: str, output: str | None, jsonld: bool, pattern: str, workers: int):
+@click.option("--resume", is_flag=True, help="Skip zips whose output already exists.")
+def batch(input_path: str, output: str | None, jsonld: bool, pattern: str, workers: int, resume: bool):
     """
     Convert many RDF/XML files to gzipped JSONL.
 
@@ -500,7 +602,7 @@ def batch(input_path: str, output: str | None, jsonld: bool, pattern: str, worke
                 (zf, out_dir / zf.with_suffix(".jsonl.gz").name)
                 for zf in zip_files
             ]
-            _batch_from_zips(zip_outputs, jsonld, pattern, workers)
+            _batch_from_zips(zip_outputs, jsonld, pattern, workers, resume=resume)
             return
 
         if not entries:
@@ -520,7 +622,7 @@ def batch(input_path: str, output: str | None, jsonld: bool, pattern: str, worke
         # Single zip — route through chunk-based parallel processing
         if output is None:
             output = str(src.with_suffix(".jsonl.gz"))
-        _batch_from_zips([(src, Path(output))], jsonld, pattern, workers)
+        _batch_from_zips([(src, Path(output))], jsonld, pattern, workers, resume=resume)
         return
 
     click.echo(f"Error: {input_path} is not a directory or zip file.", err=True)

@@ -4,6 +4,9 @@ version = "0.1.0"
 description = "Bulk-convert RDF/XML to queryable JSONL, Parquet, or standards-compliant JSON-LD."
 readme = "README.md"
 license = "MIT"
+authors = [
+    { name = "Sebastian Majstorovic", email = "storytracer@gmail.com" },
+]
 requires-python = ">=3.11"
 dependencies = [
     "rdflib>=7.0",

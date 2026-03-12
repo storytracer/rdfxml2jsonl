@@ -1,4 +1,7 @@
 # /// script
+# authors = [
+#     { name = "Sebastian Majstorovic", email = "storytracer@gmail.com" },
+# ]
 # requires-python = ">=3.11"
 # dependencies = [
 #     "rdflib>=7.0",

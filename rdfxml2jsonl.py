@@ -948,7 +948,7 @@ def single(input_file: str, output: str | None, jsonld: bool):
 @click.option("--glob", "pattern", type=str, default="*.xml", help="File glob pattern. [default: *.xml]")
 @click.option("-w", "--workers", type=int, default=None, help="Parallel workers. [default: number of CPUs]")
 @click.option("--compresslevel", type=click.IntRange(0, 9), default=6, help="Gzip compression level (0=none, 9=max). [default: 6]")
-@click.option("--resume", is_flag=True, help="Skip zips whose output already exists.")
+@click.option("--resume", is_flag=True, default=True, help="Skip zips whose output already exists.")
 @click.option("--cache-dir", type=click.Path(), default=None,
               help="Cache directory for remote downloads. [default: <output>/.cache]")
 def batch(input_path: str, output: str | None, formats: str, jsonld: bool,

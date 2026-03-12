@@ -709,7 +709,14 @@ def _batch_from_zips_remote(
                 except Exception:
                     click.echo(f"[{idx}/{n}] Downloading {zip_name}...")
 
-                fs.get(remote_zip, str(cached_zip))
+                tmp = cached_zip.with_suffix(".zip.tmp")
+                try:
+                    with fs.open(remote_zip, "rb") as src, open(tmp, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+                    tmp.rename(cached_zip)
+                except BaseException:
+                    tmp.unlink(missing_ok=True)
+                    raise
             else:
                 click.echo(f"[{idx}/{n}] Using cached {zip_name}")
 

@@ -275,7 +275,6 @@ def _parse_one(
     """Worker: parse one RDF/XML file, return (name, json_line, error_msg)."""
     try:
         data = parse_rdfxml(source, jsonld=jsonld)
-        data["_source_file"] = name
         line = orjson.dumps(data).decode()
         return (name, line, None)
     except Exception as e:
@@ -297,7 +296,6 @@ def _parse_chunk(
             try:
                 xml_bytes = zf.read(entry_name)
                 data = parse_rdfxml(xml_bytes, jsonld=jsonld)
-                data["_source_file"] = source_name
                 line = orjson.dumps(data).decode()
                 results.append((source_name, line, None))
             except Exception as e:
@@ -516,7 +514,6 @@ def _batch_single(
             for name, source in tqdm(entries, desc="Converting", unit="file"):
                 try:
                     data = parse_rdfxml(source, jsonld=jsonld)
-                    data["_source_file"] = name
                     gz.write(orjson.dumps(data).decode())
                     gz.write("\n")
                     success += 1
@@ -670,7 +667,6 @@ def batch(input_path: str, output: str | None, jsonld: bool, pattern: str,
 
     Credentials for remote storage are embedded in the URL.
 
-    A "_source_file" field is added to every record for traceability.
     Use --jsonld for standards-compliant JSON-LD output.
     """
     workers = max(1, workers if workers is not None else os.cpu_count() or 4)

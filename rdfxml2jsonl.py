@@ -343,7 +343,7 @@ def _batch_from_zips(
             continue
         to_process.append((zp, out))
 
-    to_process.sort(key=lambda pair: pair[0].stat().st_size, reverse=True)
+
 
     if skipped_resume:
         click.echo(f"Resuming: skipped {skipped_resume} already-completed zip(s).")

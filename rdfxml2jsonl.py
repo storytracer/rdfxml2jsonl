@@ -725,6 +725,7 @@ def _batch_from_zips_remote(
                 out_dir, formats,
                 jsonld, pattern, workers, compresslevel, resume=False,
             )
+            cached_zip.unlink(missing_ok=True)
 
     except KeyboardInterrupt:
         click.echo("\n\nInterrupted.", err=True)

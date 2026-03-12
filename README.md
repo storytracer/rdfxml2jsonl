@@ -1,8 +1,8 @@
 # rdfpress
 
-Bulk-convert RDF/XML files to queryable JSONL or standards-compliant JSON-LD.
+Bulk-convert RDF/XML files to queryable JSONL, Parquet, or standards-compliant JSON-LD.
 
-Parses RDF/XML using [rdflib](https://rdflib.readthedocs.io/) and outputs either **simplified JSONL** optimised for analytical querying, or **valid JSON-LD** suitable for RDF pipelines. Handles single files, directories, and zip archives.
+Parses RDF/XML using [rdflib](https://rdflib.readthedocs.io/) and outputs either **simplified JSON** optimised for analytical querying, or **valid JSON-LD** suitable for RDF pipelines. Handles single files, directories, zip archives, and remote sources via [fsspec](https://filesystem-spec.readthedocs.io/).
 
 ## Installation
 
@@ -23,17 +23,20 @@ uv run rdfpress.py single input.xml
 # Single file → valid JSON-LD
 uv run rdfpress.py single input.xml --jsonld
 
-# Directory of files → gzipped JSONL
-uv run rdfpress.py batch input_dir/ -o output.jsonl.gz
+# Directory of XML files → gzipped JSONL (default format)
+uv run rdfpress.py batch input_dir/ -o out_dir/
 
 # Zip archive → gzipped JSONL
-uv run rdfpress.py batch archive.zip -o output.jsonl.gz
+uv run rdfpress.py batch archive.zip -o out_dir/
 
-# Folder of zip archives → one .jsonl.gz per zip
-uv run rdfpress.py batch zip_folder/ -o out_dir/
-
-# Use 8 parallel workers (default: 4)
+# Folder of zip archives → one output file per zip
 uv run rdfpress.py batch zip_folder/ -o out_dir/ -w 8
+
+# Multiple output formats at once
+uv run rdfpress.py batch archive.zip -o out_dir/ --format jsonl.gz,parquet
+
+# Remote zips via FTP (or any fsspec-supported URL)
+uv run rdfpress.py batch ftp://user:pass@host/path/ -o out_dir/
 
 # Resume after interruption (skips already-completed zips)
 uv run rdfpress.py batch zip_folder/ -o out_dir/ --resume
@@ -56,18 +59,13 @@ Transformations applied:
 | `@type` inside nodes | *(removed)* | Redundant with grouping key |
 | `@context` | *(removed)* | Prefixes baked into keys |
 
-Types occurring once are stored as a single object. Types occurring more than once are stored as an array. Nodes without `@type` are grouped under `_untyped`.
+Types occurring once are stored as an array. Nodes without `@type` are grouped under `_untyped`.
 
 > **Note:** This is a one-way transformation. The output is not valid JSON-LD and cannot be round-tripped back to RDF.
 
 ### JSON-LD (`--jsonld`)
 
 Standards-compliant JSON-LD with `@context`, `@type`, `@id` wrappers, and typed values preserved exactly as rdflib serialises them. Can be loaded by any JSON-LD processor and converted back to RDF.
-
-```bash
-uv run rdfpress.py single input.xml --jsonld
-uv run rdfpress.py batch input_dir/ -o output.jsonl.gz --jsonld
-```
 
 ## Commands
 
@@ -82,16 +80,15 @@ uv run rdfpress.py single [OPTIONS] INPUT_FILE
 | Option | Description |
 |---|---|
 | `-o, --output PATH` | Output path. Default: input with `.json` (or `.jsonld`) extension |
-| `--indent INT` | JSON indentation level (default: 2) |
 | `--jsonld` | Output valid JSON-LD instead of simplified JSON |
 
 ### `batch`
 
-Convert many RDF/XML files to gzipped JSONL. Input can be a directory of XML files, a zip archive, or a directory of zip archives.
+Convert many RDF/XML files to JSONL, gzipped JSONL, and/or Parquet.
 
-When given a directory of zip files (no XML files matching the glob pattern), each zip produces its own `.jsonl.gz` file with the same basename. Otherwise all input files are written to a single output file.
+`INPUT_PATH` can be a local path or any fsspec-compatible URL (`ftp://`, `s3://`, etc.). Accepts a directory of XML files, a `.zip` archive, or a directory of `.zip` archives.
 
-Parsing is parallelised across files (or across zip archives in multi-zip mode) using a configurable number of workers.
+Output is stored in per-format subdirectories under the output directory (e.g. `out/jsonl.gz/`, `out/parquet/`).
 
 ```
 uv run rdfpress.py batch [OPTIONS] INPUT_PATH
@@ -99,13 +96,14 @@ uv run rdfpress.py batch [OPTIONS] INPUT_PATH
 
 | Option | Description |
 |---|---|
-| `-o, --output PATH` | Output file (single source) or directory (folder of zips). Default: `<input>.jsonl.gz` |
+| `-o, --output PATH` | Output directory. Per-format subdirectories are created inside |
+| `--format FORMATS` | Comma-separated output formats: `jsonl`, `jsonl.gz`, `parquet` (default: `jsonl.gz`) |
 | `--jsonld` | Output valid JSON-LD instead of simplified JSON |
 | `--glob PATTERN` | File glob pattern (default: `*.xml`) |
-| `-w, --workers INT` | Number of parallel workers (default: `4`) |
-| `--resume` | Skip zips whose output already exists (for crash recovery) |
-
-Each input file becomes one JSON line in the output. A `_source_file` field is added to every record for traceability.
+| `-w, --workers INT` | Number of parallel workers (default: number of CPUs) |
+| `--compresslevel INT` | Gzip compression level, 0–9 (default: `6`) |
+| `--resume` | Skip zips whose output already exists (enabled by default) |
+| `--cache-dir PATH` | Cache directory for remote downloads (default: `<output>/.cache`) |
 
 ## Library use
 
@@ -133,6 +131,7 @@ data = parse_rdfxml(xml_bytes)
 1. **Parse** — rdflib reads the RDF/XML and builds an in-memory RDF graph.
 2. **Serialise** — The graph is serialised to JSON-LD with a compact context derived from the file's own `xmlns` namespace declarations.
 3. **Simplify** (unless `--jsonld`) — The `@graph` array is regrouped by `@type`, and JSON-LD value wrappers are unwrapped where no information is lost.
+4. **Export** — The JSONL intermediate is converted to each requested output format (gzipped JSONL, Parquet via DuckDB, or plain JSONL).
 
 Namespace prefixes are inferred from each file, so the converter works with any RDF vocabulary without configuration.
 
@@ -141,27 +140,21 @@ Namespace prefixes are inferred from each file, so the converter works with any 
 The simplified JSONL output is designed for direct use with analytical tools:
 
 ```sql
--- DuckDB
-SELECT * FROM read_json('output.jsonl.gz') LIMIT 10;
+-- DuckDB: query gzipped JSONL directly
+SELECT * FROM read_json('out/jsonl.gz/data.jsonl.gz') LIMIT 10;
 
--- Convert to Parquet for faster repeated queries
-COPY (SELECT * FROM read_json('output.jsonl.gz'))
-TO 'output.parquet' (FORMAT PARQUET);
-```
-
-```bash
-# jq
-zcat output.jsonl.gz | jq '._source_file'
+-- DuckDB: query Parquet output
+SELECT * FROM 'out/parquet/data.parquet' LIMIT 10;
 ```
 
 ```python
 # Pandas
 import pandas as pd
-df = pd.read_json("output.jsonl.gz", lines=True)
+df = pd.read_json("out/jsonl.gz/data.jsonl.gz", lines=True)
 
 # Polars
 import polars as pl
-df = pl.read_ndjson("output.jsonl.gz")
+df = pl.read_ndjson("out/jsonl.gz/data.jsonl.gz")
 ```
 
 ## Limitations

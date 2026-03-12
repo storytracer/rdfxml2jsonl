@@ -10,11 +10,12 @@
 # ]
 # ///
 """
-rdfpress — Bulk-convert RDF/XML to queryable JSONL or JSON-LD.
+rdfpress — Bulk-convert RDF/XML to queryable JSONL, Parquet, or JSON-LD.
 
 Parses RDF/XML files using rdflib and outputs either simplified JSON
 for efficient bulk processing, or standards-compliant JSON-LD suitable
-for use in RDF pipelines.
+for use in RDF pipelines.  Supports local files, zip archives, and
+remote sources via fsspec (FTP, S3, etc.).
 
 OUTPUT MODES
 ============
@@ -45,12 +46,23 @@ JSON-LD (--jsonld):
     as rdflib serialises them. The compact context is derived from each
     file's own xmlns namespace declarations.
 
+OUTPUT FORMATS (batch)
+======================
+
+Batch output is stored in per-format subdirectories under the output
+directory.  Use --format to select one or more (comma-separated):
+
+  jsonl      — uncompressed JSONL
+  jsonl.gz   — gzip-compressed JSONL (default)
+  parquet    — Apache Parquet via DuckDB
+
 Usage:
     uv run rdfpress.py single input.xml
     uv run rdfpress.py single input.xml --jsonld
-    uv run rdfpress.py batch  input_dir/ -o output.jsonl.gz
-    uv run rdfpress.py batch  archive.zip -o output.jsonl.gz --jsonld
+    uv run rdfpress.py batch  input_dir/ -o out_dir/
+    uv run rdfpress.py batch  archive.zip -o out_dir/ --jsonld
     uv run rdfpress.py batch  zip_folder/ -o out_dir/ -w 8
+    uv run rdfpress.py batch  ftp://user:pass@host/path/ -o out_dir/
 """
 
 import dataclasses
@@ -919,7 +931,7 @@ def _batch_from_zips_remote(
 
 @click.group()
 def cli():
-    """Convert RDF/XML to simplified JSON or standards-compliant JSON-LD."""
+    """Convert RDF/XML to queryable JSONL, Parquet, or standards-compliant JSON-LD."""
 
 
 @cli.command()

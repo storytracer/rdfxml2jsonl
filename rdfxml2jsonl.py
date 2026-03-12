@@ -53,6 +53,7 @@ Usage:
     uv run rdfxml2jsonl.py batch  zip_folder/ -o out_dir/ -w 8
 """
 
+import dataclasses
 import duckdb
 import gzip
 import os
@@ -74,6 +75,7 @@ from rdflib import Graph
 from rdflib.plugins.serializers.jsonld import from_rdf
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, MofNCompleteColumn, TimeRemainingColumn
+from rich.table import Table
 
 console = Console(stderr=False)
 err_console = Console(stderr=True)
@@ -313,6 +315,117 @@ def _parse_chunk(
 
 
 # ---------------------------------------------------------------------------
+# Batch stats / reporting
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass
+class ZipRow:
+    """Per-zip result used to build the summary table."""
+    stem: str
+    ok: int = 0
+    fail: int = 0
+    produced: dict[str, Path] = dataclasses.field(default_factory=dict)
+    errors: list[str] = dataclasses.field(default_factory=list)
+    status: str = "ok"       # "ok" | "skip" | "error"
+    reason: str = ""         # reason string when status != "ok"
+
+
+@dataclasses.dataclass
+class BatchStats:
+    """Aggregated batch results returned by _batch_from_zips."""
+    skipped_resume: int = 0
+    skipped_empty: int = 0
+    skipped_bad: int = 0
+    rows: list[ZipRow] = dataclasses.field(default_factory=list)
+
+    @property
+    def ok(self) -> int:
+        return sum(r.ok for r in self.rows)
+
+    @property
+    def fail(self) -> int:
+        return sum(r.fail for r in self.rows)
+
+    @property
+    def n_processed(self) -> int:
+        return sum(1 for r in self.rows if r.status == "ok")
+
+    def merge(self, other: "BatchStats") -> None:
+        """Merge *other* into this instance (used by remote batching)."""
+        self.skipped_resume += other.skipped_resume
+        self.skipped_empty += other.skipped_empty
+        self.skipped_bad += other.skipped_bad
+        self.rows.extend(other.rows)
+
+
+def _print_batch_report(stats: BatchStats, formats: list[str]) -> None:
+    """Print a rich table summarising all processed zips."""
+    ok_rows = [r for r in stats.rows if r.status == "ok"]
+
+    if ok_rows:
+        table = Table(
+            show_header=True, header_style="bold", box=None,
+            pad_edge=False, padding=(0, 2),
+        )
+        table.add_column("Zip")
+        table.add_column("Records", justify="right")
+        for fmt in formats:
+            table.add_column(fmt, justify="right")
+        table.add_column("Errors", justify="right")
+
+        for r in ok_rows:
+            sizes = []
+            for fmt in formats:
+                if fmt in r.produced and r.produced[fmt].exists():
+                    mb = r.produced[fmt].stat().st_size / (1024 * 1024)
+                    sizes.append(f"{mb:.1f} MB")
+                else:
+                    sizes.append("–")
+            err_cell = f"[red]{r.fail:,}[/]" if r.fail else "[dim]–[/]"
+            table.add_row(r.stem, f"{r.ok:,}", *sizes, err_cell)
+
+        console.print()
+        console.print(table)
+
+    # Errors detail (below table)
+    for r in ok_rows:
+        if r.errors:
+            console.print(f"  [dim]{r.stem}:[/]")
+            for e in r.errors[:_MAX_ERRORS_SHOWN]:
+                console.print(f"    [red]>[/] {e[:120]}")
+            if len(r.errors) > _MAX_ERRORS_SHOWN:
+                console.print(
+                    f"    [dim]… {len(r.errors) - _MAX_ERRORS_SHOWN} "
+                    f"more errors suppressed[/]"
+                )
+
+    # Skip rows (if any)
+    skip_rows = [r for r in stats.rows if r.status in ("skip", "error")]
+    for r in skip_rows:
+        console.print(f"  [yellow]SKIP[/] {r.stem}: {r.reason}")
+
+    # Summary line
+    console.print()
+    parts = []
+    if stats.skipped_resume:
+        parts.append(f"{stats.skipped_resume} skipped (resume)")
+    if stats.skipped_empty:
+        parts.append(f"{stats.skipped_empty} skipped (empty)")
+    if stats.skipped_bad:
+        parts.append(f"{stats.skipped_bad} skipped (bad)")
+    summary = (
+        f"[bold]Done.[/] {stats.n_processed} zip(s), "
+        f"[green]{stats.ok:,}[/] records converted"
+    )
+    if stats.fail:
+        summary += f", [red]{stats.fail:,}[/] failed"
+    summary += "."
+    if parts:
+        summary += f"  [dim]({', '.join(parts)})[/]"
+    console.print(summary)
+
+
+# ---------------------------------------------------------------------------
 # Batch helpers
 # ---------------------------------------------------------------------------
 
@@ -322,7 +435,7 @@ def _batch_from_zips(
     formats: list[str],
     jsonld: bool, pattern: str, workers: int,
     compresslevel: int = 6, resume: bool = False,
-):
+) -> BatchStats:
     """Process zip files sequentially with parallel chunk parsing within each.
 
     Zips are processed one at a time through a shared worker pool.  This
@@ -333,25 +446,17 @@ def _batch_from_zips(
     converted to each requested output format (jsonl, jsonl.gz, parquet).
     Output is stored in per-format subdirectories under *out_dir*.
 
-    Args:
-        zip_stems:    (zip_path, stem) pairs — stem used for output filenames.
-        out_dir:      Root output directory (format subdirs created inside).
-        formats:      Requested output formats (e.g. ``["jsonl.gz", "parquet"]``).
-        jsonld:       Output valid JSON-LD instead of simplified JSON.
-        pattern:      Glob pattern for matching entries (e.g. ``"*.xml"``).
-        workers:      Number of parallel workers.
-        compresslevel: Gzip compression level for jsonl.gz output.
-        resume:       Skip zips whose outputs already exist.
+    Returns a BatchStats with per-zip results; the caller is responsible
+    for printing the report via ``_print_batch_report``.
     """
     suffix = pattern.replace("*", "")  # e.g. "*.xml" -> ".xml"
     pool_size = max(1, workers)
-    n_total = len(zip_stems)
+    stats = BatchStats()
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # --- Phase 0: filter (resume) and clean stale intermediates ---
     to_process: list[tuple[Path, str]] = []
-    skipped_resume = 0
 
     for zp, stem in zip_stems:
         # Clean stale intermediate / tmp files
@@ -360,19 +465,16 @@ def _batch_from_zips(
             if stale.exists():
                 stale.unlink()
         if resume and _stem_complete(stem, out_dir, formats):
-            skipped_resume += 1
+            stats.skipped_resume += 1
             continue
         to_process.append((zp, stem))
 
-    if skipped_resume:
-        console.print(f"[dim]Skipped {skipped_resume} zip(s) (already complete)[/]")
     if not to_process:
-        console.print("[dim]Nothing to process — all outputs already exist.[/]")
-        return
+        if stats.skipped_resume:
+            console.print("[dim]Nothing to process — all outputs already exist.[/]")
+        return stats
 
     # --- Phase 1: process each zip through a shared pool ---
-    grand_ok, grand_fail = 0, 0
-    skipped_bad, skipped_empty = 0, 0
     n_to_do = len(to_process)
     current_tmp: Path | None = None
 
@@ -384,14 +486,14 @@ def _batch_from_zips(
 
     try:
         for zip_idx, (zp, stem) in enumerate(to_process, 1):
-            tag = f"[dim]\\[{zip_idx}/{n_to_do}][/] "
-
             # 1a. Read central directory --------------------------------
             try:
                 zf_handle = zipfile.ZipFile(zp, "r")
             except (zipfile.BadZipFile, EOFError, OSError) as exc:
-                console.print(f"{tag}[yellow]SKIP[/] {zp.name}: {exc}")
-                skipped_bad += 1
+                stats.skipped_bad += 1
+                stats.rows.append(ZipRow(
+                    stem=stem, status="skip", reason=str(exc),
+                ))
                 continue
 
             with zf_handle:
@@ -401,11 +503,11 @@ def _batch_from_zips(
                 )
 
             if not members:
-                console.print(
-                    f"{tag}[yellow]SKIP[/] {zp.name}: "
-                    f"no entries matching '{pattern}'"
-                )
-                skipped_empty += 1
+                stats.skipped_empty += 1
+                stats.rows.append(ZipRow(
+                    stem=stem, status="skip",
+                    reason=f"no entries matching '{pattern}'",
+                ))
                 continue
 
             # 1b. Adaptive chunking -------------------------------------
@@ -419,15 +521,16 @@ def _batch_from_zips(
             tmp_path = out_dir / f"{stem}.jsonl.tmp"
             jsonl_path = out_dir / f"{stem}.jsonl"
             current_tmp = tmp_path
-            ok, fail = 0, 0
-            errors: list[str] = []
+            row = ZipRow(stem=stem)
             zp_str = str(zp)
 
             try:
                 with open(tmp_path, "w", encoding="utf-8") as f:
                     with Progress(
                         SpinnerColumn(),
-                        TextColumn(f"{tag}{zp.name}"),
+                        TextColumn(
+                            f"[dim]\\[{zip_idx}/{n_to_do}][/] {zp.name}"
+                        ),
                         BarColumn(bar_width=30),
                         MofNCompleteColumn(),
                         TimeRemainingColumn(),
@@ -444,10 +547,10 @@ def _batch_from_zips(
                                     if line is not None:
                                         f.write(line)
                                         f.write("\n")
-                                        ok += 1
+                                        row.ok += 1
                                     else:
-                                        errors.append(error)
-                                        fail += 1
+                                        row.errors.append(error)
+                                        row.fail += 1
                                 progress.update(task, advance=len(chunk_names))
                         else:
                             # Parallel
@@ -460,10 +563,10 @@ def _batch_from_zips(
                                     results = fut.result()
                                 except Exception as exc:
                                     failed_names = futures[fut]
-                                    errors.append(
+                                    row.errors.append(
                                         f"chunk ({len(failed_names)} entries): {exc}"
                                     )
-                                    fail += len(failed_names)
+                                    row.fail += len(failed_names)
                                     progress.update(task, advance=len(failed_names))
                                     continue
 
@@ -471,10 +574,10 @@ def _batch_from_zips(
                                     if line is not None:
                                         f.write(line)
                                         f.write("\n")
-                                        ok += 1
+                                        row.ok += 1
                                     else:
-                                        errors.append(error)
-                                        fail += 1
+                                        row.errors.append(error)
+                                        row.fail += 1
                                 progress.update(task, advance=len(results))
 
                 # 1d. Atomic rename of intermediate ----------------------
@@ -482,42 +585,24 @@ def _batch_from_zips(
                 current_tmp = None
 
                 # 1e. Export to requested formats -------------------------
-                produced = _export_formats(
+                row.produced = _export_formats(
                     jsonl_path, stem, out_dir, formats, compresslevel,
                 )
                 jsonl_path.unlink()
 
             except Exception as exc:
-                console.print(f"{tag}[red]ERROR[/] {zp.name}: {exc}")
                 if tmp_path.exists():
                     tmp_path.unlink()
                 if jsonl_path.exists():
                     jsonl_path.unlink()
                 current_tmp = None
-                skipped_bad += 1
+                stats.skipped_bad += 1
+                row.status = "error"
+                row.reason = str(exc)
+                stats.rows.append(row)
                 continue
 
-            # 1f. Per-zip summary ---------------------------------------
-            fmt_sizes = "  ".join(
-                f"{fmt} {p.stat().st_size / (1024 * 1024):.1f} MB"
-                for fmt, p in produced.items()
-            )
-            status = "[green]OK[/]" if fail == 0 else "[yellow]OK[/]"
-            console.print(
-                f"{tag}{status} {stem}  "
-                f"[bold]{ok:,}[/] records  {fmt_sizes}"
-                + (f"  [red]{fail:,} failed[/]" if fail else "")
-            )
-            if errors:
-                for e in errors[:_MAX_ERRORS_SHOWN]:
-                    console.print(f"       [red]>[/] {e[:120]}")
-                if len(errors) > _MAX_ERRORS_SHOWN:
-                    console.print(
-                        f"       [dim]… {len(errors) - _MAX_ERRORS_SHOWN} "
-                        f"more errors suppressed[/]"
-                    )
-            grand_ok += ok
-            grand_fail += fail
+            stats.rows.append(row)
             del members, chunks
 
     except KeyboardInterrupt:
@@ -534,22 +619,7 @@ def _batch_from_zips(
         if pool is not None:
             pool.shutdown(wait=False, cancel_futures=True)
 
-    # --- Phase 2: final report ---
-    console.print()
-    console.print(f"[bold]Done.[/] Processed {n_to_do} zip(s) of {n_total} total.")
-    parts = []
-    if skipped_resume:
-        parts.append(f"{skipped_resume} resumed")
-    if skipped_empty:
-        parts.append(f"{skipped_empty} empty")
-    if skipped_bad:
-        parts.append(f"{skipped_bad} bad")
-    if parts:
-        console.print(f"  Skipped  {' · '.join(parts)}")
-    console.print(
-        f"  Records  [green]{grand_ok:,}[/] converted"
-        + (f"  [red]{grand_fail:,}[/] failed" if grand_fail else "")
-    )
+    return stats
 
 
 def _batch_single(
@@ -733,11 +803,12 @@ def _batch_from_zips_remote(
     Each ZIP is downloaded via *fs* to *cache_dir*.  Already-cached files
     are reused without re-downloading.  Processing is delegated to the
     existing ``_batch_from_zips`` pipeline which operates on local paths.
+    Results are accumulated and printed as a single report at the end.
     """
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     n = len(zip_paths)
-    skipped_resume = 0
+    combined = BatchStats()
 
     try:
         for idx, remote_zip in enumerate(zip_paths, 1):
@@ -747,7 +818,7 @@ def _batch_from_zips_remote(
 
             # Resume: skip if all format outputs already exist
             if resume and _stem_complete(stem, out_dir, formats):
-                skipped_resume += 1
+                combined.skipped_resume += 1
                 continue
 
             # Download only if not already cached
@@ -773,11 +844,12 @@ def _batch_from_zips_remote(
             else:
                 console.print(f"{tag}[dim]cached[/] {zip_name}")
 
-            _batch_from_zips(
+            batch_stats = _batch_from_zips(
                 [(cached_zip, stem)],
                 out_dir, formats,
                 jsonld, pattern, workers, compresslevel, resume=False,
             )
+            combined.merge(batch_stats)
             cached_zip.unlink(missing_ok=True)
 
     except KeyboardInterrupt:
@@ -787,8 +859,7 @@ def _batch_from_zips_remote(
         )
         sys.exit(130)
 
-    if skipped_resume:
-        console.print(f"[dim]Skipped {skipped_resume} zip(s) (already complete)[/]")
+    _print_batch_report(combined, formats)
 
 
 # ---------------------------------------------------------------------------
@@ -892,10 +963,11 @@ def batch(input_path: str, output: str | None, formats: str, jsonld: bool,
                     (Path(zf), Path(zf).stem)
                     for zf in zip_files
                 ]
-                _batch_from_zips(
+                stats = _batch_from_zips(
                     zip_stems, out_dir, format_list,
                     jsonld, pattern, workers, compresslevel, resume=resume,
                 )
+                _print_batch_report(stats, format_list)
                 return
 
             if not entries:
@@ -936,11 +1008,12 @@ def batch(input_path: str, output: str | None, formats: str, jsonld: bool,
         if is_local:
             out_dir = Path(output) if output else Path(root).parent
             stem = Path(root).stem
-            _batch_from_zips(
+            stats = _batch_from_zips(
                 [(Path(root), stem)],
                 out_dir, format_list,
                 jsonld, pattern, workers, compresslevel, resume=resume,
             )
+            _print_batch_report(stats, format_list)
         else:
             out_dir = Path(output) if output else Path(".")
             out_dir.mkdir(parents=True, exist_ok=True)

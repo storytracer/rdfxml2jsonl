@@ -11,10 +11,8 @@ dependencies = [
     "tqdm>=4.0",
     "fsspec>=2026.2.0",
     "orjson>=3.10",
+    "duckdb>=1.0",
 ]
-
-[project.optional-dependencies]
-parquet = ["duckdb>=1.0"]
 
 [project.scripts]
 rdfxml2jsonl = "rdfxml2jsonl:cli"

@@ -6,6 +6,7 @@
 #     "tqdm>=4.0",
 #     "fsspec>=2026.2.0",
 #     "orjson>=3.10",
+#     "duckdb>=1.0",
 # ]
 # ///
 """
@@ -52,6 +53,7 @@ Usage:
     uv run rdfxml2jsonl.py batch  zip_folder/ -o out_dir/ -w 8
 """
 
+import duckdb
 import gzip
 import os
 import orjson
@@ -599,13 +601,6 @@ def _stem_complete(stem: str, out_dir: Path, formats: list[str]) -> bool:
 
 def _to_parquet(jsonl_path: Path, parquet_path: Path) -> None:
     """Convert an uncompressed JSONL file to Parquet via DuckDB."""
-    try:
-        import duckdb
-    except ImportError:
-        raise click.ClickException(
-            "DuckDB is required for Parquet output. "
-            "Install it with:  uv pip install duckdb"
-        )
     if jsonl_path.stat().st_size == 0:
         return
     tmp = parquet_path.with_suffix(".parquet.tmp")
@@ -803,18 +798,6 @@ def batch(input_path: str, output: str | None, formats: str, jsonld: bool,
         click.echo(f"Error: unknown format(s): {', '.join(bad)}", err=True)
         click.echo(f"Valid formats: {', '.join(sorted(valid_formats))}", err=True)
         sys.exit(1)
-
-    # Early check: parquet requires duckdb
-    if "parquet" in format_list:
-        try:
-            import duckdb  # noqa: F401
-        except ImportError:
-            click.echo(
-                "Error: DuckDB is required for Parquet output. "
-                "Install it with:  uv pip install duckdb",
-                err=True,
-            )
-            sys.exit(1)
 
     # --- Resolve input via fsspec (handles local paths and remote URLs) ---
     try:

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project overview
 
-Single-file Python CLI tool (`rdfpress.py`) that bulk-converts RDF/XML files to queryable JSONL, gzipped JSONL, Parquet, or standards-compliant JSON-LD using rdflib. Built for large-scale data analysis on Europeana's aggregated cultural heritage metadata, which is published as RDF/XML in zip archives on a public FTP server (`ftp://download.europeana.eu/dataset/`). This is why the tool supports remote file sources via fsspec (FTP, S3, etc.) and efficiently bulk-processes zip archives. Uses Click for CLI, Rich for progress/output, and `ProcessPoolExecutor` for parallelism.
+Single-file Python CLI tool (`rdfpress.py`) that bulk-converts RDF/XML files to queryable JSONL, gzipped JSONL, Parquet, or standards-compliant JSON-LD using rdflib. Built for large-scale data analysis on Europeana's aggregated cultural heritage metadata, which is published as RDF/XML in zip archives on a public FTP server (`ftp://download.europeana.eu/dataset/XML/`). This is why the tool supports remote file sources via fsspec (FTP, S3, etc.) and efficiently bulk-processes zip archives. Uses Click for CLI, Rich for progress/output, and `ProcessPoolExecutor` for parallelism.
 
 ## Running
 

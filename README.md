@@ -8,7 +8,7 @@ rdfpress converts RDF/XML files into clean JSONL, Parquet, or JSON-LD that you c
 
 ## Why this tool exists
 
-rdfpress was built to enable large-scale data analysis on [Europeana](https://www.europeana.eu/)'s aggregated cultural heritage metadata. Europeana publishes the metadata of all objects in its repository as RDF/XML files on a [public FTP server](https://europeana.atlassian.net/wiki/spaces/EF/pages/2324463617/Dataset+download+and+OAI-PMH+service#Europeana%E2%80%99s-FTP-server) (`ftp://download.europeana.eu/dataset/`), organized as one zip archive per dataset, regenerated weekly. This is why rdfpress supports remote file sources (via [fsspec](https://filesystem-spec.readthedocs.io/), covering FTP, S3, and other protocols) and bulk-processes zip archives efficiently — it was designed to convert Europeana's entire metadata collection into formats suitable for analytical querying.
+rdfpress was built to enable large-scale data analysis on [Europeana](https://www.europeana.eu/)'s aggregated cultural heritage metadata. Europeana publishes the metadata of all objects in its repository as RDF/XML files on a [public FTP server](https://europeana.atlassian.net/wiki/spaces/EF/pages/2324463617/Dataset+download+and+OAI-PMH+service#Europeana%E2%80%99s-FTP-server) (`ftp://download.europeana.eu/dataset/XML/`), organized as one zip archive per dataset, regenerated weekly. This is why rdfpress supports remote file sources (via [fsspec](https://filesystem-spec.readthedocs.io/), covering FTP, S3, and other protocols) and bulk-processes zip archives efficiently — it was designed to convert Europeana's entire metadata collection into formats suitable for analytical querying.
 
 ## How it works
 

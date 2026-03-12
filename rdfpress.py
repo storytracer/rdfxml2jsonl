@@ -92,7 +92,10 @@ import humanfriendly
 from rdflib import Graph
 from rdflib.plugins.serializers.jsonld import from_rdf
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, MofNCompleteColumn, TimeRemainingColumn
+from rich.progress import (
+    Progress, SpinnerColumn, BarColumn, TextColumn, MofNCompleteColumn,
+    TimeRemainingColumn, DownloadColumn, TransferSpeedColumn,
+)
 from rich.table import Table
 
 console = Console(stderr=False)
@@ -891,19 +894,29 @@ def _batch_from_zips_remote(
             # Download only if not already cached
             tag = f"[dim]\\[{idx}/{n}][/] "
             if not cached_zip.exists():
+                total_bytes: int | None = None
                 try:
                     info = fs.info(remote_zip)
-                    size_mb = info.get("size", 0) / (1024 * 1024)
-                    console.print(
-                        f"{tag}Downloading {zip_name} ({size_mb:.0f} MB)…"
-                    )
+                    total_bytes = info.get("size") or None
                 except Exception:
-                    console.print(f"{tag}Downloading {zip_name}…")
+                    pass
 
                 tmp = cached_zip.with_suffix(".zip.tmp")
                 try:
-                    with fs.open(remote_zip, "rb") as src, open(tmp, "wb") as dst:
-                        shutil.copyfileobj(src, dst)
+                    with Progress(
+                        TextColumn(f"{tag}{{task.description}}"),
+                        BarColumn(),
+                        DownloadColumn(),
+                        TransferSpeedColumn(),
+                        TimeRemainingColumn(),
+                        console=console,
+                        transient=True,
+                    ) as progress:
+                        task = progress.add_task(zip_name, total=total_bytes)
+                        with fs.open(remote_zip, "rb") as src, open(tmp, "wb") as dst:
+                            while chunk := src.read(8 * 1024 * 1024):
+                                dst.write(chunk)
+                                progress.advance(task, len(chunk))
                     tmp.rename(cached_zip)
                 except BaseException:
                     tmp.unlink(missing_ok=True)

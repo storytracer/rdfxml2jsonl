@@ -6,6 +6,10 @@ RDF/XML is the standard way to publish linked data, but it's notoriously hard to
 
 rdfpress converts RDF/XML files into clean JSONL, Parquet, or JSON-LD that you can query directly with DuckDB, Pandas, Polars, jq, or any tool that understands JSON. It handles single files, directories, zip archives, and remote sources over FTP or S3. Processing is parallelized and memory-efficient, so it scales from one record to thousands of large zip archives.
 
+## Why this tool exists
+
+rdfpress was built to enable large-scale data analysis on [Europeana](https://www.europeana.eu/)'s aggregated cultural heritage metadata. Europeana publishes the metadata of all objects in its repository as RDF/XML files on a [public FTP server](https://europeana.atlassian.net/wiki/spaces/EF/pages/2324463617/Dataset+download+and+OAI-PMH+service#Europeana%E2%80%99s-FTP-server) (`ftp://download.europeana.eu/dataset/`), organized as one zip archive per dataset, regenerated weekly. This is why rdfpress supports remote file sources (via [fsspec](https://filesystem-spec.readthedocs.io/), covering FTP, S3, and other protocols) and bulk-processes zip archives efficiently — it was designed to convert Europeana's entire metadata collection into formats suitable for analytical querying.
+
 ## How it works
 
 rdfpress reads RDF/XML with [rdflib](https://rdflib.readthedocs.io/) and converts it through a four-step pipeline:

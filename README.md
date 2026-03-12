@@ -2,90 +2,24 @@
 
 **Turn RDF/XML into something you can actually query.**
 
-RDF/XML is the standard serialization for linked data, but it's notoriously difficult to work with using everyday data tools. rdfpress converts RDF/XML files into clean JSONL, Parquet, or JSON-LD so you can query them directly with DuckDB, Pandas, Polars, jq, or any JSON-friendly tool — no SPARQL endpoint required.
+RDF/XML is the standard way to publish linked data, but it's notoriously hard to work with using everyday data tools. You can't load it into a DataFrame, query it with SQL, or pipe it through jq without a lot of plumbing. The typical workaround — standing up a SPARQL endpoint — adds infrastructure you may not want or need.
 
-It handles single files, directories full of XML, zip archives, and even remote sources over FTP or S3. Processing is parallelized and memory-efficient, so it scales from a single record to thousands of large zip archives.
+rdfpress converts RDF/XML files into clean JSONL, Parquet, or JSON-LD that you can query directly with DuckDB, Pandas, Polars, jq, or any tool that understands JSON. It handles single files, directories, zip archives, and remote sources over FTP or S3. Processing is parallelized and memory-efficient, so it scales from one record to thousands of large zip archives.
 
-## Examples
+## How it works
 
-**Convert a single file and inspect the output:**
+rdfpress reads RDF/XML with [rdflib](https://rdflib.readthedocs.io/) and converts it through a four-step pipeline:
 
-```bash
-uv run rdfpress.py single record.xml
-# → record.json (simplified, directly queryable)
-```
+1. **Parse** — rdflib builds an in-memory RDF graph from the XML.
+2. **Serialize** — The graph is serialized to JSON-LD, using namespace prefixes inferred from each file's own `xmlns` declarations (no configuration needed).
+3. **Simplify** (default) — The verbose JSON-LD structure is restructured into compact, directly queryable JSON (see [below](#what-simplification-does)). Skip this step with `--jsonld` to get standards-compliant JSON-LD instead.
+4. **Export** — Output is written as JSONL, gzipped JSONL, or Parquet (via DuckDB).
 
-**Bulk-convert a folder of zip archives to Parquet for analysis:**
+## What simplification does
 
-```bash
-uv run rdfpress.py batch downloads/ -o out/ --format parquet -w 8
-# → out/parquet/*.parquet (one file per zip, 8 parallel workers)
-```
+JSON-LD is verbose by design. Every value is wrapped in metadata containers like `{"@id": "..."}` or `{"@value": 42, "@type": "xsd:long"}`, and all nodes sit in a flat `@graph` array regardless of type. This is correct for RDF processors, but painful for data analysis — you can't just `SELECT *` or load it into a DataFrame without significant post-processing.
 
-**Query the result with DuckDB — no setup, no loading step:**
-
-```sql
-SELECT * FROM 'out/parquet/data.parquet' WHERE "dc:title" IS NOT NULL LIMIT 10;
-```
-
-**Pull remote files directly from an FTP server:**
-
-```bash
-uv run rdfpress.py batch ftp://user:pass@data.example.org/exports/ -o out/
-```
-
-**Need standards-compliant JSON-LD instead?** Add `--jsonld` to preserve full RDF semantics:
-
-```bash
-uv run rdfpress.py single record.xml --jsonld
-# → record.jsonld (valid JSON-LD, round-trippable to RDF)
-```
-
-## Installation
-
-Requires [uv](https://docs.astral.sh/uv/). No manual dependency installation needed — `uv run` handles everything automatically.
-
-Alternatively, install as a package for library or CLI use:
-
-```bash
-pip install git+https://github.com/storytracer/rdfpress.git
-```
-
-## Quick start
-
-```bash
-# Single file → simplified JSON
-uv run rdfpress.py single input.xml
-
-# Single file → valid JSON-LD
-uv run rdfpress.py single input.xml --jsonld
-
-# Directory of XML files → gzipped JSONL (default format)
-uv run rdfpress.py batch input_dir/ -o out_dir/
-
-# Zip archive → gzipped JSONL
-uv run rdfpress.py batch archive.zip -o out_dir/
-
-# Folder of zip archives → one output file per zip
-uv run rdfpress.py batch zip_folder/ -o out_dir/ -w 8
-
-# Multiple output formats at once
-uv run rdfpress.py batch archive.zip -o out_dir/ --format jsonl.gz,parquet
-
-# Remote zips via FTP (or any fsspec-supported URL)
-uv run rdfpress.py batch ftp://user:pass@host/path/ -o out_dir/
-
-# Disable automatic resume (re-process all zips, even completed ones)
-uv run rdfpress.py batch zip_folder/ -o out_dir/ --no-resume
-```
-
-## Output modes
-
-### Simplified JSON (default)
-
-JSON-LD is verbose by design — every value is wrapped in metadata containers like `{"@id": "..."}` or `{"@value": 42, "@type": "xsd:long"}`, and all nodes sit in a flat `@graph` array regardless of type. This is great for RDF processors but painful for data analysis: you can't just `SELECT *` or load it into a DataFrame without significant post-processing.
-
-Simplified mode strips that ceremony. It groups nodes by their RDF type, unwraps value containers to native JSON types, and drops metadata that becomes redundant after restructuring. The result is compact JSON you can query directly.
+Simplified mode strips that ceremony. It groups nodes by RDF type, unwraps value containers to native JSON types, and removes metadata that becomes redundant after restructuring.
 
 **Before (JSON-LD):**
 
@@ -132,90 +66,63 @@ Simplified mode strips that ceremony. It groups nodes by their RDF type, unwraps
 
 What changed:
 
-- **`@graph` array → grouped by `@type`** — each type is a top-level key, so you can access e.g. all agents directly without filtering.
+- **`@graph` array → grouped by `@type`** — each type becomes a top-level key, so you can access all agents or all items directly without filtering.
 - **`{"@id": "http://..."}` → `"http://..."`** — URI references become plain strings.
 - **`{"@value": 1503, "@type": "xsd:int"}` → `1503`** — typed literals become native JSON values.
-- **Language-tagged strings are kept as-is** — `{"@value": "...", "@language": "en"}` stays, because the language tag carries meaningful information.
-- **`@type` removed from each node** — it's redundant with the grouping key.
+- **Language-tagged strings stay as-is** — `{"@value": "...", "@language": "en"}` is preserved because the language tag carries meaningful information.
+- **`@type` removed from each node** — redundant with the grouping key.
 - **`@context` removed** — namespace prefixes are already baked into the property names.
 
-> **Note:** This is a one-way transformation. The output is not valid JSON-LD and cannot be round-tripped back to RDF.
+Nodes without a `@type` are grouped under `_untyped`.
 
-### JSON-LD (`--jsonld`)
+> **Note:** Simplification is a one-way transformation. The output is not valid JSON-LD and cannot be round-tripped back to RDF. Use `--jsonld` when you need to preserve full RDF semantics.
 
-Standards-compliant JSON-LD with `@context`, `@type`, `@id` wrappers, and typed values preserved exactly as rdflib serialises them. Can be loaded by any JSON-LD processor and converted back to RDF.
+## Installation
 
-## Commands
+Requires [uv](https://docs.astral.sh/uv/). No manual dependency installation needed — `uv run` handles everything automatically.
 
-### `single`
-
-Convert a single RDF/XML file.
-
-```
-uv run rdfpress.py single [OPTIONS] INPUT_FILE
-```
-
-| Option | Description |
-|---|---|
-| `-o, --output PATH` | Output path. Default: input with `.json` (or `.jsonld`) extension |
-| `--jsonld` | Output valid JSON-LD instead of simplified JSON |
-
-### `batch`
-
-Convert many RDF/XML files to JSONL, gzipped JSONL, and/or Parquet.
-
-`INPUT_PATH` can be a local path or any fsspec-compatible URL (`ftp://`, `s3://`, etc.). Accepts a directory of XML files, a `.zip` archive, or a directory of `.zip` archives.
-
-Output is stored in per-format subdirectories under the output directory (e.g. `out/jsonl.gz/`, `out/parquet/`).
-
-```
-uv run rdfpress.py batch [OPTIONS] INPUT_PATH
-```
-
-| Option | Description |
-|---|---|
-| `-o, --output PATH` | Output directory. Per-format subdirectories are created inside |
-| `--format FORMATS` | Comma-separated output formats: `jsonl`, `jsonl.gz`, `parquet` (default: `jsonl.gz`) |
-| `--jsonld` | Output valid JSON-LD instead of simplified JSON |
-| `--glob PATTERN` | File glob pattern (default: `*.xml`) |
-| `-w, --workers INT` | Number of parallel workers (default: number of CPUs) |
-| `--compresslevel INT` | Gzip compression level, 0–9 (default: `6`) |
-| `--resume` | Skip zips whose output already exists (enabled by default) |
-| `--cache-dir PATH` | Cache directory for remote downloads (default: `<output>/.cache`) |
-
-## Library use
-
-The script is importable as a Python module:
+Alternatively, install as a package:
 
 ```bash
 pip install git+https://github.com/storytracer/rdfpress.git
 ```
 
-```python
-from rdfpress import parse_rdfxml
+## Usage
 
-# Simplified JSON
-data = parse_rdfxml("input.xml")
+### Convert a single file
 
-# Valid JSON-LD
-data = parse_rdfxml("input.xml", jsonld=True)
+```bash
+uv run rdfpress.py single record.xml
+# → record.json (simplified)
 
-# From raw bytes (e.g. read from an API, database, or zip)
-data = parse_rdfxml(xml_bytes)
+uv run rdfpress.py single record.xml --jsonld
+# → record.jsonld (standards-compliant JSON-LD)
 ```
 
-## How it works
+### Batch-convert many files
 
-1. **Parse** — rdflib reads the RDF/XML and builds an in-memory RDF graph.
-2. **Serialise** — The graph is serialised to JSON-LD with a compact context derived from the file's own `xmlns` namespace declarations.
-3. **Simplify** (unless `--jsonld`) — The `@graph` array is regrouped by `@type`, and JSON-LD value wrappers are unwrapped where no information is lost.
-4. **Export** — The JSONL intermediate is converted to each requested output format (gzipped JSONL, Parquet via DuckDB, or plain JSONL).
+```bash
+# Directory of XML files → gzipped JSONL
+uv run rdfpress.py batch input_dir/ -o out/
 
-Namespace prefixes are inferred from each file, so the converter works with any RDF vocabulary without configuration.
+# Zip archive → gzipped JSONL
+uv run rdfpress.py batch archive.zip -o out/
 
-## Querying the output
+# Folder of zip archives, 8 parallel workers
+uv run rdfpress.py batch zip_folder/ -o out/ -w 8
 
-The simplified JSONL output is designed for direct use with analytical tools:
+# Multiple output formats at once
+uv run rdfpress.py batch archive.zip -o out/ --format jsonl.gz,parquet
+
+# Remote zips via FTP (or any fsspec-supported URL)
+uv run rdfpress.py batch ftp://user:pass@host/path/ -o out/
+```
+
+Batch output is stored in per-format subdirectories (e.g. `out/jsonl.gz/`, `out/parquet/`). Resume is enabled by default — if a run is interrupted, rerunning the same command skips already-completed files. Disable with `--no-resume`.
+
+### Query the output
+
+The simplified output is designed for direct use with analytical tools:
 
 ```sql
 -- DuckDB: query gzipped JSONL directly
@@ -235,11 +142,59 @@ import polars as pl
 df = pl.read_ndjson("out/jsonl.gz/data.jsonl.gz")
 ```
 
+### Use as a Python library
+
+```bash
+pip install git+https://github.com/storytracer/rdfpress.git
+```
+
+```python
+from rdfpress import parse_rdfxml
+
+data = parse_rdfxml("input.xml")                # simplified JSON
+data = parse_rdfxml("input.xml", jsonld=True)    # valid JSON-LD
+data = parse_rdfxml(xml_bytes)                   # from raw bytes
+```
+
+## Command reference
+
+### `single`
+
+Convert a single RDF/XML file.
+
+```
+uv run rdfpress.py single [OPTIONS] INPUT_FILE
+```
+
+| Option | Description |
+|---|---|
+| `-o, --output PATH` | Output path. Default: input with `.json` (or `.jsonld`) extension |
+| `--jsonld` | Output valid JSON-LD instead of simplified JSON |
+
+### `batch`
+
+Batch-convert RDF/XML files to JSONL, gzipped JSONL, and/or Parquet. `INPUT_PATH` can be a directory of XML files, a `.zip` archive, a directory of `.zip` archives, or any [fsspec](https://filesystem-spec.readthedocs.io/)-compatible URL (`ftp://`, `s3://`, etc.).
+
+```
+uv run rdfpress.py batch [OPTIONS] INPUT_PATH
+```
+
+| Option | Description |
+|---|---|
+| `-o, --output PATH` | Output directory |
+| `--format FORMATS` | Comma-separated output formats: `jsonl`, `jsonl.gz`, `parquet` (default: `jsonl.gz`) |
+| `--jsonld` | Output valid JSON-LD instead of simplified JSON |
+| `--glob PATTERN` | File glob pattern (default: `*.xml`) |
+| `-w, --workers INT` | Number of parallel workers (default: number of CPUs) |
+| `--compresslevel INT` | Gzip compression level, 0–9 (default: `6`) |
+| `--resume / --no-resume` | Skip zips whose output already exists (default: enabled) |
+| `--cache-dir PATH` | Cache directory for remote downloads (default: `<output>/.cache`) |
+
 ## Limitations
 
 - **Simplified JSON is not round-trippable.** URI references, typed literals, and type annotations are stripped. Use `--jsonld` when you need to preserve full RDF semantics.
 - **Schema varies by input.** Different RDF/XML files may produce different top-level keys depending on which types they contain. DuckDB and Polars handle this gracefully via schema inference; rigid column stores may not.
-- **Processing is bounded per zip.** Only one zip's entry list and output handle are held in memory at a time, so even very large archives (10 GB+) and large batches (thousands of zips) are handled efficiently.
+- **Memory is bounded per zip.** Only one zip's entry list and output handle are held in memory at a time, so even very large archives (10 GB+) and large batches (thousands of zips) work efficiently.
 
 ## License
 

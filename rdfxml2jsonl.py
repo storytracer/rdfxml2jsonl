@@ -3,7 +3,7 @@
 # dependencies = [
 #     "rdflib>=7.0",
 #     "click>=8.0",
-#     "tqdm>=4.0",
+#     "rich>=13.0",
 #     "fsspec>=2026.2.0",
 #     "orjson>=3.10",
 #     "duckdb>=1.0",
@@ -72,7 +72,13 @@ from fsspec.implementations.local import LocalFileSystem
 import click
 from rdflib import Graph
 from rdflib.plugins.serializers.jsonld import from_rdf
-from tqdm import tqdm
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, MofNCompleteColumn, TimeRemainingColumn
+
+console = Console(stderr=False)
+err_console = Console(stderr=True)
+
+_MAX_ERRORS_SHOWN = 3  # max per-file errors shown per zip
 
 # rdflib logs noisy tracebacks for certain literal type conversions that fail
 # (e.g. values that don't match their declared XSD datatype). The original
@@ -359,9 +365,9 @@ def _batch_from_zips(
         to_process.append((zp, stem))
 
     if skipped_resume:
-        click.echo(f"Resuming: skipped {skipped_resume} already-completed zip(s).")
+        console.print(f"[dim]Skipped {skipped_resume} zip(s) (already complete)[/]")
     if not to_process:
-        click.echo("Nothing to process — all outputs already exist.")
+        console.print("[dim]Nothing to process — all outputs already exist.[/]")
         return
 
     # --- Phase 1: process each zip through a shared pool ---
@@ -378,11 +384,13 @@ def _batch_from_zips(
 
     try:
         for zip_idx, (zp, stem) in enumerate(to_process, 1):
+            tag = f"[dim]\\[{zip_idx}/{n_to_do}][/] "
+
             # 1a. Read central directory --------------------------------
             try:
                 zf_handle = zipfile.ZipFile(zp, "r")
             except (zipfile.BadZipFile, EOFError, OSError) as exc:
-                tqdm.write(f"[{zip_idx}/{n_to_do}] SKIP {zp.name}: {exc}")
+                console.print(f"{tag}[yellow]SKIP[/] {zp.name}: {exc}")
                 skipped_bad += 1
                 continue
 
@@ -393,8 +401,8 @@ def _batch_from_zips(
                 )
 
             if not members:
-                tqdm.write(
-                    f"[{zip_idx}/{n_to_do}] SKIP {zp.name}: "
+                console.print(
+                    f"{tag}[yellow]SKIP[/] {zp.name}: "
                     f"no entries matching '{pattern}'"
                 )
                 skipped_empty += 1
@@ -412,48 +420,51 @@ def _batch_from_zips(
             jsonl_path = out_dir / f"{stem}.jsonl"
             current_tmp = tmp_path
             ok, fail = 0, 0
+            errors: list[str] = []
             zp_str = str(zp)
-            desc = (
-                f"[{zip_idx}/{n_to_do}] {zp.name}"
-            )
 
             try:
                 with open(tmp_path, "w", encoding="utf-8") as f:
-                    if pool is None:
-                        # Sequential (workers=1)
-                        for chunk_names in tqdm(
-                            chunks, desc=desc, unit="chunk", leave=False,
-                        ):
-                            results = _parse_chunk(zp_str, chunk_names, jsonld)
-                            for _n, line, error in results:
-                                if line is not None:
-                                    f.write(line)
-                                    f.write("\n")
-                                    ok += 1
-                                else:
-                                    tqdm.write(f"  FAILED: {error}")
-                                    fail += 1
-                    else:
-                        # Parallel
-                        futures = {
-                            pool.submit(_parse_chunk, zp_str, names, jsonld): names
-                            for names in chunks
-                        }
-                        with tqdm(
-                            total=len(members), desc=desc,
-                            unit="file", leave=False,
-                        ) as pbar:
+                    with Progress(
+                        SpinnerColumn(),
+                        TextColumn(f"{tag}{zp.name}"),
+                        BarColumn(bar_width=30),
+                        MofNCompleteColumn(),
+                        TimeRemainingColumn(),
+                        console=console,
+                        transient=True,
+                    ) as progress:
+                        task = progress.add_task("parse", total=len(members))
+
+                        if pool is None:
+                            # Sequential (workers=1)
+                            for chunk_names in chunks:
+                                results = _parse_chunk(zp_str, chunk_names, jsonld)
+                                for _n, line, error in results:
+                                    if line is not None:
+                                        f.write(line)
+                                        f.write("\n")
+                                        ok += 1
+                                    else:
+                                        errors.append(error)
+                                        fail += 1
+                                progress.update(task, advance=len(chunk_names))
+                        else:
+                            # Parallel
+                            futures = {
+                                pool.submit(_parse_chunk, zp_str, names, jsonld): names
+                                for names in chunks
+                            }
                             for fut in as_completed(futures):
                                 try:
                                     results = fut.result()
                                 except Exception as exc:
                                     failed_names = futures[fut]
-                                    tqdm.write(
-                                        f"  CHUNK ERROR ({len(failed_names)} "
-                                        f"entries): {exc}"
+                                    errors.append(
+                                        f"chunk ({len(failed_names)} entries): {exc}"
                                     )
                                     fail += len(failed_names)
-                                    pbar.update(len(failed_names))
+                                    progress.update(task, advance=len(failed_names))
                                     continue
 
                                 for _n, line, error in results:
@@ -462,9 +473,9 @@ def _batch_from_zips(
                                         f.write("\n")
                                         ok += 1
                                     else:
-                                        tqdm.write(f"  FAILED: {error}")
+                                        errors.append(error)
                                         fail += 1
-                                pbar.update(len(results))
+                                progress.update(task, advance=len(results))
 
                 # 1d. Atomic rename of intermediate ----------------------
                 tmp_path.rename(jsonl_path)
@@ -477,7 +488,7 @@ def _batch_from_zips(
                 jsonl_path.unlink()
 
             except Exception as exc:
-                tqdm.write(f"  ZIP ERROR {zp.name}: {exc}")
+                console.print(f"{tag}[red]ERROR[/] {zp.name}: {exc}")
                 if tmp_path.exists():
                     tmp_path.unlink()
                 if jsonl_path.exists():
@@ -487,25 +498,35 @@ def _batch_from_zips(
                 continue
 
             # 1f. Per-zip summary ---------------------------------------
-            fmt_sizes = ", ".join(
+            fmt_sizes = "  ".join(
                 f"{fmt} {p.stat().st_size / (1024 * 1024):.1f} MB"
                 for fmt, p in produced.items()
             )
-            tqdm.write(
-                f"  => {stem}: {ok:,} ok, {fail:,} failed "
-                f"({fmt_sizes})"
+            status = "[green]OK[/]" if fail == 0 else "[yellow]OK[/]"
+            console.print(
+                f"{tag}{status} {stem}  "
+                f"[bold]{ok:,}[/] records  {fmt_sizes}"
+                + (f"  [red]{fail:,} failed[/]" if fail else "")
             )
+            if errors:
+                for e in errors[:_MAX_ERRORS_SHOWN]:
+                    console.print(f"       [red]>[/] {e[:120]}")
+                if len(errors) > _MAX_ERRORS_SHOWN:
+                    console.print(
+                        f"       [dim]… {len(errors) - _MAX_ERRORS_SHOWN} "
+                        f"more errors suppressed[/]"
+                    )
             grand_ok += ok
             grand_fail += fail
             del members, chunks
 
     except KeyboardInterrupt:
-        click.echo("\n\nInterrupted.", err=True)
+        err_console.print("\n[bold red]Interrupted.[/]")
         if current_tmp is not None and current_tmp.exists():
             current_tmp.unlink()
-            click.echo(f"Cleaned up: {current_tmp.name}", err=True)
-        click.echo(
-            "Re-run with --resume to continue where you left off.", err=True,
+            err_console.print(f"Cleaned up: {current_tmp.name}")
+        err_console.print(
+            "[dim]Re-run with --resume to continue where you left off.[/]"
         )
         sys.exit(130)
 
@@ -514,14 +535,21 @@ def _batch_from_zips(
             pool.shutdown(wait=False, cancel_futures=True)
 
     # --- Phase 2: final report ---
-    click.echo(f"\nDone. Processed {n_to_do} zip(s) of {n_total} total.")
+    console.print()
+    console.print(f"[bold]Done.[/] Processed {n_to_do} zip(s) of {n_total} total.")
+    parts = []
     if skipped_resume:
-        click.echo(f"  Skipped (resume):  {skipped_resume}")
+        parts.append(f"{skipped_resume} resumed")
     if skipped_empty:
-        click.echo(f"  Skipped (empty):   {skipped_empty}")
+        parts.append(f"{skipped_empty} empty")
     if skipped_bad:
-        click.echo(f"  Skipped (bad zip): {skipped_bad}")
-    click.echo(f"  Records: {grand_ok:,} converted, {grand_fail:,} failed.")
+        parts.append(f"{skipped_bad} bad")
+    if parts:
+        console.print(f"  Skipped  {' · '.join(parts)}")
+    console.print(
+        f"  Records  [green]{grand_ok:,}[/] converted"
+        + (f"  [red]{grand_fail:,}[/] failed" if grand_fail else "")
+    )
 
 
 def _batch_single(
@@ -542,24 +570,37 @@ def _batch_single(
     tmp_path = out_dir / f"{stem}.jsonl.tmp"
     jsonl_path = out_dir / f"{stem}.jsonl"
 
+    errors: list[str] = []
+
     with open(tmp_path, "w", encoding="utf-8") as f:
-        if pool_size <= 1:
-            for name, source in tqdm(entries, desc="Converting", unit="file"):
-                try:
-                    data = parse_rdfxml(source, jsonld=jsonld)
-                    f.write(orjson.dumps(data).decode())
-                    f.write("\n")
-                    success += 1
-                except Exception as e:
-                    tqdm.write(f"FAILED: {name} — {e}")
-                    failed += 1
-        else:
-            with ProcessPoolExecutor(max_workers=pool_size, initializer=_init_worker) as pool:
-                futures = {
-                    pool.submit(_parse_one, name, source, jsonld): name
-                    for name, source in entries
-                }
-                with tqdm(total=len(futures), desc="Converting", unit="file") as pbar:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("Converting"),
+            BarColumn(bar_width=30),
+            MofNCompleteColumn(),
+            TimeRemainingColumn(),
+            console=console,
+            transient=True,
+        ) as progress:
+            task = progress.add_task("convert", total=len(entries))
+
+            if pool_size <= 1:
+                for name, source in entries:
+                    try:
+                        data = parse_rdfxml(source, jsonld=jsonld)
+                        f.write(orjson.dumps(data).decode())
+                        f.write("\n")
+                        success += 1
+                    except Exception as e:
+                        errors.append(f"{name} — {e}")
+                        failed += 1
+                    progress.update(task, advance=1)
+            else:
+                with ProcessPoolExecutor(max_workers=pool_size, initializer=_init_worker) as pool:
+                    futures = {
+                        pool.submit(_parse_one, name, source, jsonld): name
+                        for name, source in entries
+                    }
                     for fut in as_completed(futures):
                         name, line, error = fut.result()
                         if line is not None:
@@ -567,9 +608,9 @@ def _batch_single(
                             f.write("\n")
                             success += 1
                         else:
-                            tqdm.write(f"FAILED: {error}")
+                            errors.append(error)
                             failed += 1
-                        pbar.update(1)
+                        progress.update(task, advance=1)
 
     tmp_path.rename(jsonl_path)
 
@@ -577,11 +618,23 @@ def _batch_single(
     produced = _export_formats(jsonl_path, stem, out_dir, formats, compresslevel)
     jsonl_path.unlink()
 
-    click.echo(f"\n  {success} converted, {failed} failed out of {len(entries)} files.")
+    console.print()
+    console.print(
+        f"[bold]Done.[/] [green]{success:,}[/] converted"
+        + (f", [red]{failed:,}[/] failed" if failed else "")
+        + f" out of {len(entries):,} files."
+    )
+    if errors:
+        for e in errors[:_MAX_ERRORS_SHOWN]:
+            console.print(f"  [red]>[/] {e[:120]}")
+        if len(errors) > _MAX_ERRORS_SHOWN:
+            console.print(
+                f"  [dim]… {len(errors) - _MAX_ERRORS_SHOWN} more errors suppressed[/]"
+            )
     if produced:
         for fmt, p in produced.items():
             size_mb = p.stat().st_size / (1024 * 1024)
-            click.echo(f"  {fmt}: {p} ({size_mb:.1f} MB)")
+            console.print(f"  {fmt}: {p} ({size_mb:.1f} MB)")
 
 
 # ---------------------------------------------------------------------------
@@ -698,16 +751,16 @@ def _batch_from_zips_remote(
                 continue
 
             # Download only if not already cached
+            tag = f"[dim]\\[{idx}/{n}][/] "
             if not cached_zip.exists():
                 try:
                     info = fs.info(remote_zip)
                     size_mb = info.get("size", 0) / (1024 * 1024)
-                    click.echo(
-                        f"[{idx}/{n}] Downloading {zip_name} "
-                        f"({size_mb:.0f} MB)..."
+                    console.print(
+                        f"{tag}Downloading {zip_name} ({size_mb:.0f} MB)…"
                     )
                 except Exception:
-                    click.echo(f"[{idx}/{n}] Downloading {zip_name}...")
+                    console.print(f"{tag}Downloading {zip_name}…")
 
                 tmp = cached_zip.with_suffix(".zip.tmp")
                 try:
@@ -718,7 +771,7 @@ def _batch_from_zips_remote(
                     tmp.unlink(missing_ok=True)
                     raise
             else:
-                click.echo(f"[{idx}/{n}] Using cached {zip_name}")
+                console.print(f"{tag}[dim]cached[/] {zip_name}")
 
             _batch_from_zips(
                 [(cached_zip, stem)],
@@ -728,14 +781,14 @@ def _batch_from_zips_remote(
             cached_zip.unlink(missing_ok=True)
 
     except KeyboardInterrupt:
-        click.echo("\n\nInterrupted.", err=True)
-        click.echo(
-            "Re-run with --resume to continue where you left off.", err=True,
+        err_console.print("\n[bold red]Interrupted.[/]")
+        err_console.print(
+            "[dim]Re-run with --resume to continue where you left off.[/]"
         )
         sys.exit(130)
 
     if skipped_resume:
-        click.echo(f"Resuming: skipped {skipped_resume} already-completed zip(s).")
+        console.print(f"[dim]Skipped {skipped_resume} zip(s) (already complete)[/]")
 
 
 # ---------------------------------------------------------------------------
@@ -760,7 +813,7 @@ def single(input_file: str, output: str | None, jsonld: bool):
         output = str(Path(input_file).with_suffix(suffix))
 
     Path(output).write_bytes(orjson.dumps(data, option=orjson.OPT_INDENT_2))
-    click.echo(f"Converted: {input_file} -> {output}")
+    console.print(f"[green]OK[/] {input_file} → {output}")
 
 
 @cli.command()
@@ -803,21 +856,21 @@ def batch(input_path: str, output: str | None, formats: str, jsonld: bool,
     format_list = [f.strip() for f in formats.split(",")]
     valid_formats = {"jsonl", "jsonl.gz", "parquet"}
     if bad := set(format_list) - valid_formats:
-        click.echo(f"Error: unknown format(s): {', '.join(bad)}", err=True)
-        click.echo(f"Valid formats: {', '.join(sorted(valid_formats))}", err=True)
+        err_console.print(f"[red]Error:[/] unknown format(s): {', '.join(bad)}")
+        err_console.print(f"Valid formats: {', '.join(sorted(valid_formats))}")
         sys.exit(1)
 
     # --- Resolve input via fsspec (handles local paths and remote URLs) ---
     try:
         fs, root = fsspec.url_to_fs(input_path)
     except Exception as exc:
-        click.echo(f"Error: cannot open {input_path}: {exc}", err=True)
+        err_console.print(f"[red]Error:[/] cannot open {input_path}: {exc}")
         sys.exit(1)
 
     is_local = isinstance(fs, LocalFileSystem)
 
     if not fs.exists(root):
-        click.echo(f"Error: {input_path} does not exist.", err=True)
+        err_console.print(f"[red]Error:[/] {input_path} does not exist.")
         sys.exit(1)
 
     # --- Directory input ---
@@ -846,10 +899,9 @@ def batch(input_path: str, output: str | None, formats: str, jsonld: bool,
                 return
 
             if not entries:
-                click.echo(
-                    f"Error: no files matching '{pattern}' and no .zip files "
-                    f"in {input_path}",
-                    err=True,
+                err_console.print(
+                    f"[red]Error:[/] no files matching '{pattern}' and no "
+                    f".zip files in {input_path}"
                 )
                 sys.exit(1)
 
@@ -864,12 +916,12 @@ def batch(input_path: str, output: str | None, formats: str, jsonld: bool,
         else:
             # Remote directory — must contain zips
             if not zip_files:
-                click.echo(
-                    f"Error: no .zip files found at {input_path}", err=True,
+                err_console.print(
+                    f"[red]Error:[/] no .zip files found at {input_path}"
                 )
                 sys.exit(1)
 
-            click.echo(f"Found {len(zip_files)} zip(s) at {input_path}")
+            console.print(f"Found {len(zip_files)} zip(s) at {input_path}")
             out_dir = Path(output) if output else Path(".")
             out_dir.mkdir(parents=True, exist_ok=True)
             c_dir = Path(cache_dir) if cache_dir else out_dir / ".cache"
@@ -899,7 +951,7 @@ def batch(input_path: str, output: str | None, formats: str, jsonld: bool,
             )
         return
 
-    click.echo(f"Error: {input_path} is not a directory or zip file.", err=True)
+    err_console.print(f"[red]Error:[/] {input_path} is not a directory or zip file.")
     sys.exit(1)
 
 

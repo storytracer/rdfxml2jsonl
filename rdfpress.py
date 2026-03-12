@@ -902,25 +902,46 @@ def _batch_from_zips_remote(
                     pass
 
                 tmp = cached_zip.with_suffix(".zip.tmp")
-                try:
-                    with Progress(
-                        TextColumn(f"{tag}{{task.description}}"),
-                        BarColumn(),
-                        DownloadColumn(),
-                        TransferSpeedColumn(),
-                        TimeRemainingColumn(),
-                        console=console,
-                        transient=True,
-                    ) as progress:
-                        task = progress.add_task(zip_name, total=total_bytes)
-                        with fs.open(remote_zip, "rb") as src, open(tmp, "wb") as dst:
-                            while chunk := src.read(8 * 1024 * 1024):
-                                dst.write(chunk)
-                                progress.advance(task, len(chunk))
-                    tmp.rename(cached_zip)
-                except BaseException:
-                    tmp.unlink(missing_ok=True)
-                    raise
+                max_retries = 5
+                for attempt in range(1, max_retries + 1):
+                    try:
+                        with Progress(
+                            TextColumn(f"{tag}{{task.description}}"),
+                            BarColumn(),
+                            DownloadColumn(),
+                            TransferSpeedColumn(),
+                            TimeRemainingColumn(),
+                            console=console,
+                            transient=True,
+                        ) as progress:
+                            task = progress.add_task(zip_name, total=total_bytes)
+                            with fs.open(remote_zip, "rb") as src, open(tmp, "wb") as dst:
+                                while chunk := src.read(8 * 1024 * 1024):
+                                    dst.write(chunk)
+                                    progress.advance(task, len(chunk))
+                        tmp.rename(cached_zip)
+                        break
+                    except KeyboardInterrupt:
+                        tmp.unlink(missing_ok=True)
+                        raise
+                    except Exception as exc:
+                        if attempt == max_retries:
+                            tmp.unlink(missing_ok=True)
+                            raise
+                        delay = 2 ** attempt
+                        err_console.print(
+                            f"{tag}[yellow]Retry {attempt}/{max_retries}[/] "
+                            f"after {delay}s — {exc}"
+                        )
+                        time.sleep(delay)
+                        tmp.unlink(missing_ok=True)
+                        # Clear cached FTP connection so fsspec reconnects
+                        fs.invalidate_cache(remote_zip)
+                        try:
+                            info = fs.info(remote_zip)
+                            total_bytes = info.get("size") or None
+                        except Exception:
+                            pass
             else:
                 console.print(f"{tag}[dim]cached[/] {zip_name}")
 

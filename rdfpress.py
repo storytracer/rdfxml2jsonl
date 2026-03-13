@@ -867,6 +867,8 @@ def _batch_from_zips_remote(
     workers: int,
     compresslevel: int,
     resume: bool,
+    input_url: str = "",
+    block_size: int = 0,
 ):
     """Download remote ZIP files to a local cache, then process them.
 
@@ -928,15 +930,22 @@ def _batch_from_zips_remote(
                         if attempt == max_retries:
                             tmp.unlink(missing_ok=True)
                             raise
-                        delay = 2 ** attempt
+                        delay = [5, 15, 30, 60, 120][min(attempt - 1, 4)]
                         err_console.print(
                             f"{tag}[yellow]Retry {attempt}/{max_retries}[/] "
                             f"after {delay}s — {exc}"
                         )
                         time.sleep(delay)
                         tmp.unlink(missing_ok=True)
-                        # Clear cached FTP connection so fsspec reconnects
-                        fs.invalidate_cache(remote_zip)
+                        # Kill dead connection and create a fresh one
+                        if input_url:
+                            try:
+                                fs.clear_instance_cache()
+                            except Exception:
+                                pass
+                            fs, _ = fsspec.url_to_fs(input_url, block_size=block_size)
+                        else:
+                            fs.invalidate_cache(remote_zip)
                         try:
                             info = fs.info(remote_zip)
                             total_bytes = info.get("size") or None
@@ -1105,6 +1114,7 @@ def batch(input_path: str, output: str | None, formats: str, jsonld: bool,
             _batch_from_zips_remote(
                 fs, zip_files, out_dir, c_dir,
                 format_list, jsonld, pattern, workers, compresslevel, resume,
+                input_url=input_path, block_size=block_size_bytes,
             )
             return
 
@@ -1126,6 +1136,7 @@ def batch(input_path: str, output: str | None, formats: str, jsonld: bool,
             _batch_from_zips_remote(
                 fs, [root], out_dir, c_dir,
                 format_list, jsonld, pattern, workers, compresslevel, resume,
+                input_url=input_path, block_size=block_size_bytes,
             )
         return
 
